@@ -147,6 +147,24 @@ class MemoryManager:
         # use a callable replacement to avoid backreference interpretation of characters in ref_new
         return re.subn(pattern, lambda _m: ref_new, content)
 
+    @staticmethod
+    def _validate_memory_path(resolved_path: Path, allowed_root: Path) -> None:
+        """Raise ValueError if resolved_path is not strictly inside allowed_root.
+
+        SEC-001: defense-in-depth against path-traversal via symlinks. The
+        lexical `".." in parts` check above catches literal ".." segments in
+        the memory name, but a subdirectory that is itself a symlink pointing
+        outside the memory root would slip past a name-only check; resolving
+        the final path and confirming it is still inside the root catches that
+        case too.
+        """
+        try:
+            resolved_path.relative_to(allowed_root)
+        except ValueError:
+            raise ValueError(
+                f"Memory path '{resolved_path}' escapes allowed root '{allowed_root}'. Path traversal is not permitted in memory names."
+            )
+
     def get_memory_file_path(self, name: str) -> Path:
         name = self._sanitize_name(name)
         parts = name.split("/")
@@ -164,9 +182,13 @@ class MemoryManager:
             filename = f"{parts[-1]}.md"
             if len(parts) > 1:
                 subdir = self._global_memory_dir / "/".join(parts[:-1])
+                candidate = (subdir / filename).resolve()
+                self._validate_memory_path(candidate, self._global_memory_dir.resolve())
                 subdir.mkdir(parents=True, exist_ok=True)
-                return subdir / filename
-            return self._global_memory_dir / filename
+                return candidate
+            candidate = (self._global_memory_dir / filename).resolve()
+            self._validate_memory_path(candidate, self._global_memory_dir.resolve())
+            return candidate
 
         # Project-local memory
         assert self._project_memory_dir is not None, "Project dir was not passed at initialization"
@@ -176,10 +198,14 @@ class MemoryManager:
         if len(parts) > 1:
             # Create subdirectory path
             subdir = self._project_memory_dir / "/".join(parts[:-1])
+            candidate = (subdir / filename).resolve()
+            self._validate_memory_path(candidate, self._project_memory_dir.resolve())
             subdir.mkdir(parents=True, exist_ok=True)
-            return subdir / filename
+            return candidate
 
-        return self._project_memory_dir / filename
+        candidate = (self._project_memory_dir / filename).resolve()
+        self._validate_memory_path(candidate, self._project_memory_dir.resolve())
+        return candidate
 
     def _check_write_access(self, name: str, is_tool_context: bool) -> None:
         # in tool context, memories can be read-only

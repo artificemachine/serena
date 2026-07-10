@@ -298,6 +298,11 @@ max-complexity = 20
 "test/solidlsp/bsl/**" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.pytest.ini_options]
+# Force this checkout's src/ ahead of any globally editable-installed solidlsp/serena
+# package on sys.path — prevents a stray `python3 -m pytest` invocation (e.g. from a
+# git hook, which bypasses the project's uv-managed venv) from resolving imports to a
+# different local clone of this fork.
+pythonpath = ["src"]
 addopts = "--snapshot-patch-pycharm-diff"
 markers = [
   "clojure: language server running for Clojure",

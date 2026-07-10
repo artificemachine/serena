@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Project-local pre-commit test runner for celstnblacc/serena.
+#
+# The global ~/.githooks/pre-commit auto-detects Python projects and always
+# runs `python3 -m pytest`, which resolves against whatever interpreter is
+# first on PATH — not this project's uv-managed venv. On this machine that
+# interpreter has an unrelated stray editable install shadowing this
+# package, so tests must run through `uv run` to get correct dependency
+# resolution. This script fully replaces the global hook's Python
+# auto-detection for this repo (see ~/.githooks/pre-commit check 4).
+#
+# Scope: the full suite (test/serena/test_serena_agent.py and friends) spins
+# up a real language server per language and takes ~10 minutes even on a
+# warm cache — impractical to run on every commit. This hook runs the fast
+# unit-test modules that actually cover changed code; the full LSP
+# integration matrix is run manually / in CI instead (last verified run:
+# 571 passed, 6 failed — Go/Nix language servers not installed locally,
+# pre-existing on a clean v1.5.3 checkout, unrelated to this fork's patches).
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+FAST_TESTS=(
+    test/serena/test_security.py
+    test/serena/test_memories_manager.py
+)
+
+if command -v uv &>/dev/null; then
+    echo "[project-hook] Running pytest via uv..."
+    uv run pytest "${FAST_TESTS[@]}"
+else
+    echo "[project-hook] uv not found, falling back to python3 -m pytest..."
+    python3 -m pytest "${FAST_TESTS[@]}"
+fi

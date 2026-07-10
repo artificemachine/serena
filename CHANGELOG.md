@@ -2,6 +2,16 @@
 
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
+## celstnblacc/serena fork sync (v0.1.6 to v1.5.3)
+
+* Security (re-applied from the pre-sync fork):
+  - **S-1:** shell metacharacter guard in `util/shell.py::execute_shell_command()` — rejects `;`, `|`, `&`, `` ` ``, `$(` before any subprocess is spawned.
+  - **S-2:** memory path-traversal guard in `MemoryManager.get_memory_file_path()` (`memories/memory_manager.py`) — `resolve()` + `relative_to()` check, added as defense-in-depth alongside upstream's own lexical `".." in parts` check (which does not catch a symlink pointing outside the memory root).
+  - **Graceful shutdown:** SIGTERM/SIGHUP handlers in `cli.py` raise `SystemExit(0)` before `server.run()` so the `server_lifespan` finally-block (language-server cleanup) executes on host exit, instead of Python's default disposition killing the process and orphaning LSP children.
+  - New `test/serena/test_security.py` (11 tests) covering S-1 and S-2.
+* Deferred: `--no-shell` trust mode and the fork's `serena doctor` command (bundled together in the pre-sync fork's v0.1.5, commit `e5c8fd50`) — `cli.py` was rewritten substantially upstream (new `serena init`/`serena setup` subcommands, `default_modes` renamed from `modes`); adapting either properly is a bigger unit of work than this security-focused pass scopes to.
+  Also deferred: the vendored MCP stdio EOF patch (`patches/stdio.py`) — needs verification against whether upstream's `mcp==1.27.0` (vs the pre-sync fork's `mcp==1.26.0`) already fixes the underlying disconnect bug natively before deciding whether to carry it forward.
+
 # v1.5.3 (2026-05-26)
 
 # v1.5.2 (2026-05-26)

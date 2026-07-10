@@ -203,6 +203,7 @@ pylint.html
 # Serena-specific
 /*.yml
 !*.template.yml
+!.shipguard.yml
 /agent-ui
 /test/**/.serena
 
