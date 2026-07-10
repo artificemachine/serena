@@ -9,10 +9,13 @@ import pathlib
 import shutil
 from typing import Any, cast
 
-import psutil
 from overrides import override
 
-from solidlsp.ls import LanguageServerDependencyProvider, LanguageServerDependencyProviderSinglePath, SolidLanguageServer
+from solidlsp.ls import (
+    LanguageServerDependencyProvider,
+    LanguageServerDependencyProviderSinglePath,
+    SolidLanguageServer,
+)
 from solidlsp.ls_config import LanguageServerConfig
 from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.settings import SolidLSPSettings
@@ -21,15 +24,32 @@ from .common import RuntimeDependency, RuntimeDependencyCollection
 
 log = logging.getLogger(__name__)
 
-# GitHub release version to download when not installed locally
-_DEFAULT_VERSION = "1.3.0"
 _GITHUB_RELEASE_BASE = "https://github.com/antaalt/shader-sense/releases/download"
 _HLSL_ALLOWED_HOSTS = ("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com")
-_HLSL_SHA256_BY_ASSET = {
-    "shader-language-server-x86_64-pc-windows-msvc.zip": "a945b000c296cdeebb9ee2d4452cec2a0f26544dd076bb08bfdcade2278296a6",
-    "shader-language-server-x86_64-unknown-linux-gnu.zip": "8c0a7b36f51cc58593762db3592ae13e21ca3cb982b2526cfaaf7c82e92ca089",
-    "shader-language-server-aarch64-pc-windows-msvc.zip": "cdbd7b41e71cf6040d5cdb7e211ba4b76671a404ee0f7add281d72d3ab8dfa65",
+
+# Version pinning convention (see eclipse_jdtls.py for the full spec):
+#   _INITIAL_* — frozen forever; legacy unversioned install dir is reserved for it.
+#   _DEFAULT_* — bumped on upgrades; goes into a versioned subdir.
+_INITIAL_VERSION = "1.3.1"
+_INITIAL_HLSL_SHA256_BY_ASSET = {
+    "shader-language-server-x86_64-pc-windows-msvc.zip": "49081c5547ddde1b8b3b17295282a80ddacbca1d6f5dcd834e2788c02bafa997",
+    "shader-language-server-x86_64-unknown-linux-gnu.zip": "61710df7ca17a2d063b598936c57c56c49fbf837707a1aa886f9b0193a35be3c",
+    "shader-language-server-aarch64-pc-windows-msvc.zip": "a3b3799affe2cad27652e788376b46fe76e1a6c2ce45946a486dcb26c9091412",
 }
+_DEFAULT_VERSION = "1.3.1"
+_DEFAULT_HLSL_SHA256_BY_ASSET = {
+    "shader-language-server-x86_64-pc-windows-msvc.zip": "49081c5547ddde1b8b3b17295282a80ddacbca1d6f5dcd834e2788c02bafa997",
+    "shader-language-server-x86_64-unknown-linux-gnu.zip": "61710df7ca17a2d063b598936c57c56c49fbf837707a1aa886f9b0193a35be3c",
+    "shader-language-server-aarch64-pc-windows-msvc.zip": "a3b3799affe2cad27652e788376b46fe76e1a6c2ce45946a486dcb26c9091412",
+}
+
+
+def _hlsl_sha(version: str, asset_name: str) -> str | None:
+    if version == _INITIAL_VERSION:
+        return _INITIAL_HLSL_SHA256_BY_ASSET.get(asset_name)
+    if version == _DEFAULT_VERSION:
+        return _DEFAULT_HLSL_SHA256_BY_ASSET.get(asset_name)
+    return None
 
 
 class HlslLanguageServer(SolidLanguageServer):
@@ -74,9 +94,7 @@ class HlslLanguageServer(SolidLanguageServer):
                         platform_id="win-x64",
                         archive_type="zip",
                         binary_name="shader-language-server.exe",
-                        sha256=_HLSL_SHA256_BY_ASSET["shader-language-server-x86_64-pc-windows-msvc.zip"]
-                        if version == _DEFAULT_VERSION
-                        else None,
+                        sha256=_hlsl_sha(version, "shader-language-server-x86_64-pc-windows-msvc.zip"),
                         allowed_hosts=_HLSL_ALLOWED_HOSTS,
                     ),
                     RuntimeDependency(
@@ -86,9 +104,7 @@ class HlslLanguageServer(SolidLanguageServer):
                         platform_id="linux-x64",
                         archive_type="zip",
                         binary_name="shader-language-server",
-                        sha256=_HLSL_SHA256_BY_ASSET["shader-language-server-x86_64-unknown-linux-gnu.zip"]
-                        if version == _DEFAULT_VERSION
-                        else None,
+                        sha256=_hlsl_sha(version, "shader-language-server-x86_64-unknown-linux-gnu.zip"),
                         allowed_hosts=_HLSL_ALLOWED_HOSTS,
                     ),
                     RuntimeDependency(
@@ -98,9 +114,7 @@ class HlslLanguageServer(SolidLanguageServer):
                         platform_id="win-arm64",
                         archive_type="zip",
                         binary_name="shader-language-server.exe",
-                        sha256=_HLSL_SHA256_BY_ASSET["shader-language-server-aarch64-pc-windows-msvc.zip"]
-                        if version == _DEFAULT_VERSION
-                        else None,
+                        sha256=_hlsl_sha(version, "shader-language-server-aarch64-pc-windows-msvc.zip"),
                         allowed_hosts=_HLSL_ALLOWED_HOSTS,
                     ),
                     RuntimeDependency(
@@ -135,7 +149,9 @@ class HlslLanguageServer(SolidLanguageServer):
                     "See https://github.com/antaalt/shader-sense for more details."
                 )
 
-            install_dir = os.path.join(self._ls_resources_dir, "shader-language-server")
+            # legacy unversioned dir reserved for INITIAL; every other version goes into a versioned subdir
+            ls_dirname = "shader-language-server" if version == _INITIAL_VERSION else f"shader-language-server-{version}"
+            install_dir = os.path.join(self._ls_resources_dir, ls_dirname)
             executable_path = deps.binary_path(install_dir)
 
             if not os.path.exists(executable_path):
@@ -235,38 +251,6 @@ class HlslLanguageServer(SolidLanguageServer):
             log.warning("shader-language-server does not advertise definitionProvider")
 
         self.server.notify.initialized({})
-
-    @override
-    def stop(self, shutdown_timeout: float = 2.0) -> None:
-        """Kill the shader-language-server process tree before the standard shutdown.
-
-        The base _shutdown() calls process.terminate() directly on the subprocess,
-        which on Windows with shell=True only kills the cmd.exe wrapper, leaving
-        the actual shader-language-server binary running as an orphan. We use psutil
-        to terminate the full process tree first.
-        """
-        process = self.server.process if self.server else None
-        if process and process.pid and process.returncode is None:
-            try:
-                parent = psutil.Process(process.pid)
-                children = parent.children(recursive=True)
-                for child in children:
-                    try:
-                        child.terminate()
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-                psutil.wait_procs(children, timeout=2)
-                for child in children:
-                    try:
-                        if child.is_running():
-                            child.kill()
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-            except Exception as e:
-                log.debug(f"Error cleaning up shader-language-server process tree: {e}")
-        super().stop(shutdown_timeout)
 
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:

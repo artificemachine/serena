@@ -26,12 +26,13 @@ from serena.constants import (
     PROJECT_LOCAL_TEMPLATE_FILE,
     PROJECT_TEMPLATE_FILE,
     REPO_ROOT,
+    RESOURCES_DIR,
     SERENA_CONFIG_TEMPLATE_FILE,
     SERENA_FILE_ENCODING,
     SERENA_MANAGED_DIR_NAME,
 )
 from serena.util.inspection import determine_programming_language_composition
-from serena.util.yaml import YamlCommentNormalisation, load_yaml, normalise_yaml_comments, save_yaml, transfer_missing_yaml_comments
+from serena.util.yaml import YamlCommentNormalisation, load_yaml, normalise_yaml_comments, save_yaml, transfer_yaml_comments
 from solidlsp.ls_config import Language
 
 from ..analytics import RegisteredTokenCountEstimator
@@ -61,6 +62,10 @@ class SerenaPaths:
             home_dir = str(Path.home() / SERENA_MANAGED_DIR_NAME)
         else:
             home_dir = home_dir.strip()
+        self.resources_dir: str = RESOURCES_DIR
+        """
+        the resources directory (within the `serena` package) 
+        """
         self.serena_user_home_dir: str = home_dir
         """
         the path to the Serena home directory, where the user's configuration/data is stored.
@@ -83,9 +88,25 @@ class SerenaPaths:
         If a name of a mode matches a name of a mode in SERENAS_OWN_MODES_YAML_DIR,
         the user mode will override the default mode definition.
         """
-        self.news_snippet_id_file: str = os.path.join(self.serena_user_home_dir, "last_read_news_snippet_id.txt")
+        self.news_legacy_last_read_id_file: str = os.path.join(self.serena_user_home_dir, "last_read_news_snippet_id.txt")
         """
         file containing the ID of the last read news snippet
+        """
+        self.news_read_items_file: str = os.path.join(self.serena_user_home_dir, "news_read.pkl")
+        """
+        file containing the ID of the last read news snippet
+        """
+        self.news_etag_file: str = os.path.join(self.serena_user_home_dir, "news_etag.txt")
+        """
+        file containing the ETag of the last fetched remote news JSON
+        """
+        self.news_file: str = os.path.join(self.serena_user_home_dir, "news.json")
+        """
+        local cache of the remote news JSON file
+        """
+        self.news_dir: str = os.path.join(REPO_ROOT, "news")
+        """
+        repository news directory containing the source HTML snippets and generated news.json
         """
         global_memories_path = Path(os.path.join(self.serena_user_home_dir, "memories", "global"))
         global_memories_path.mkdir(parents=True, exist_ok=True)
@@ -108,6 +129,9 @@ class SerenaPaths:
         os.makedirs(log_dir, exist_ok=True)
         self.last_returned_log_file_path = os.path.join(log_dir, prefix + "_" + datetime_tag() + f"_{os.getpid()}" + ".txt")
         return self.last_returned_log_file_path
+
+    def get_resource_path(self, *path_elems: str) -> Path:
+        return Path(os.path.join(self.resources_dir, *path_elems))
 
     # TODO: Paths from constants.py should be moved here
 
@@ -152,8 +176,20 @@ class NamedToolInclusionDefinition(ToolInclusionDefinition):
 
 @dataclass
 class ModeSelectionDefinition:
-    base_modes: Sequence[str] | None = None
     default_modes: Sequence[str] | None = None
+
+
+@dataclass
+class ModeSelectionDefinitionWithBaseModes(ModeSelectionDefinition):
+    base_modes: Sequence[str] | None = ("interactive", "editing")
+    """
+    the base modes to use, which are always guaranteed to be included
+    """
+
+
+@dataclass
+class ModeSelectionDefinitionWithAddedModes(ModeSelectionDefinition):
+    added_modes: Sequence[str] | None = None
 
 
 class LanguageBackend(Enum):
@@ -212,7 +248,7 @@ class LineEnding(Enum):
 
 
 @dataclass
-class SharedConfig(ModeSelectionDefinition, ToolInclusionDefinition, ToStringMixin):
+class SharedConfig(ToolInclusionDefinition, ToStringMixin):
     """Shared between SerenaConfig and ProjectConfig, the latter used to override values in the form
     (same as in ModeSelectionDefinition).
     The defaults here shall be none and should be set to the global default values in SerenaConfig.
@@ -239,10 +275,11 @@ Uses $projectDir and $projectFolderName as placeholders.
 
 
 @dataclass(kw_only=True)
-class ProjectConfig(SharedConfig):
+class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
     project_name: str
     languages: list[Language]
     ignored_paths: list[str] = field(default_factory=list)
+    additional_workspace_folders: list[str] = field(default_factory=list)
     read_only: bool = False
     ignore_all_files_in_gitignore: bool = True
     initial_prompt: str = ""
@@ -402,6 +439,10 @@ class ProjectConfig(SharedConfig):
             data["languages"] = [data["language"]]
             del data["language"]
 
+        # Note: Checks for validity of fields must not happen here but in _from_dict.
+        # Here, the data may be incomplete, because this function is also used for
+        # loading project.local.yml files.
+
         return data, was_complete
 
     @classmethod
@@ -445,13 +486,24 @@ class ProjectConfig(SharedConfig):
         line_ending_value = data.get("line_ending")
         line_ending = LineEnding.from_str(line_ending_value) if line_ending_value else None
 
+        # gracefully handle user errors: incorrect use of None/empty where a list is required
+        ignored_paths = data["ignored_paths"] or []
+        fixed_tools = data["fixed_tools"] or []
+        excluded_tools = data["excluded_tools"] or []
+        included_optional_tools = data["included_optional_tools"] or []
+        additional_workspace_folders = data.get("additional_workspace_folders") or []
+
+        if "base_modes" in data and data["base_modes"] is not None:
+            log.warning("The base_modes setting in project.yml is deprecated and will be ignored.")
+
         return cls(
             project_name=data["project_name"],
             languages=languages,
-            ignored_paths=data["ignored_paths"],
-            excluded_tools=data["excluded_tools"],
-            fixed_tools=data["fixed_tools"],
-            included_optional_tools=data["included_optional_tools"],
+            ignored_paths=ignored_paths,
+            additional_workspace_folders=additional_workspace_folders,
+            excluded_tools=excluded_tools,
+            fixed_tools=fixed_tools,
+            included_optional_tools=included_optional_tools,
             read_only=data["read_only"],
             read_only_memory_patterns=data.get("read_only_memory_patterns", []),
             ignored_memory_patterns=data.get("ignored_memory_patterns", []),
@@ -460,7 +512,7 @@ class ProjectConfig(SharedConfig):
             encoding=data["encoding"],
             line_ending=line_ending,
             language_backend=language_backend,
-            base_modes=data["base_modes"],
+            added_modes=data["added_modes"],
             default_modes=data["default_modes"],
             symbol_info_budget=symbol_info_budget,
             ls_specific_settings=data.get("ls_specific_settings", {}),
@@ -565,7 +617,7 @@ class ProjectConfig(SharedConfig):
 
         # transfer missing comments from the template file
         template_config, _ = self._load_yaml_dict(PROJECT_TEMPLATE_FILE, self.YAML_COMMENT_NORMALISATION)
-        transfer_missing_yaml_comments(template_config, config_with_comments, self.YAML_COMMENT_NORMALISATION, force_update_all=True)
+        transfer_yaml_comments(template_config, config_with_comments, self.YAML_COMMENT_NORMALISATION, force_update_all=True)
 
         # save project.yml
         save_yaml(config_path, config_with_comments)
@@ -651,7 +703,7 @@ class RegisteredProject(ToStringMixin):
 
 
 @dataclass(kw_only=True)
-class SerenaConfig(SharedConfig):
+class SerenaConfig(SharedConfig, ModeSelectionDefinitionWithBaseModes):
     """
     Holds the Serena agent configuration, which is typically loaded from a YAML configuration file
     (when instantiated via :method:`from_config_file`), which is updated when projects are added or removed.
@@ -666,6 +718,7 @@ class SerenaConfig(SharedConfig):
     trace_lsp_communication: bool = False
     web_dashboard: bool = True
     web_dashboard_open_on_launch: bool = True
+    web_dashboard_interface: str | None = None
     web_dashboard_listen_address: str = "127.0.0.1"
     jetbrains_plugin_server_address: str = "127.0.0.1"
     tool_timeout: float = DEFAULT_TOOL_TIMEOUT
@@ -704,7 +757,6 @@ class SerenaConfig(SharedConfig):
     """
     the language backend to use for code understanding features
     """
-    default_modes: Sequence[str] | None = ("interactive", "editing")
     line_ending: LineEnding = LineEnding.NATIVE
     symbol_info_budget: float = 10.0
     """
@@ -827,7 +879,7 @@ class SerenaConfig(SharedConfig):
         if "projects" not in loaded_commented_yaml:
             raise SerenaConfigError("`projects` key not found in Serena configuration. Please update your `serena_config.yml` file.")
         instance.projects = []
-        for path in loaded_commented_yaml["projects"]:
+        for path in loaded_commented_yaml["projects"] or []:
             path = Path(path).resolve()
             try:
                 path_exists = path.exists()
@@ -842,7 +894,18 @@ class SerenaConfig(SharedConfig):
                 if path is None:
                     continue
                 num_migrations += 1
-            project_config = ProjectConfig.load(path, serena_config=instance)  # instance is sufficiently populated
+            try:
+                project_config = ProjectConfig.load(path, serena_config=instance)  # instance is sufficiently populated
+            except Exception as e:
+                log.error(
+                    "Failed to load project configuration for %s: %s. "
+                    "This project will be skipped. Fix or delete its "
+                    ".serena/project.yml (or remove it from "
+                    "serena_config.yml) to re-enable it.",
+                    path,
+                    e,
+                )
+                continue
             project = RegisteredProject(
                 project_root=str(path),
                 project_config=project_config,
@@ -1047,7 +1110,7 @@ class SerenaConfig(SharedConfig):
         # For some keys, we force updates, because old comments are problematic/misleading.
         normalise_yaml_comments(commented_yaml, YamlCommentNormalisation.LEADING_WITH_CONVERSION_FROM_TRAILING)
         template_yaml = load_yaml(SERENA_CONFIG_TEMPLATE_FILE, comment_normalisation=YamlCommentNormalisation.LEADING)
-        transfer_missing_yaml_comments(template_yaml, commented_yaml, YamlCommentNormalisation.LEADING, force_update_all=True)
+        transfer_yaml_comments(template_yaml, commented_yaml, YamlCommentNormalisation.LEADING, force_update_all=True)
 
         save_yaml(self.config_file_path, commented_yaml)
 

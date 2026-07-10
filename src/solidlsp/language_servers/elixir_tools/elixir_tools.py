@@ -4,11 +4,12 @@ import pathlib
 import stat
 import subprocess
 import threading
+from collections.abc import Hashable
 from typing import Any, cast
 
 from overrides import override
 
-from solidlsp.ls import SolidLanguageServer
+from solidlsp.ls import RawDocumentSymbol, SolidLanguageServer
 from solidlsp.ls_config import Language, LanguageServerConfig
 from solidlsp.ls_utils import FileUtils, PlatformId, PlatformUtils
 from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
@@ -215,6 +216,45 @@ class ElixirTools(SolidLanguageServer):
         # Set generous timeout for Expert which can be slow to initialize and respond
         self.set_request_timeout(180.0)
 
+    @override
+    def _document_symbols_cache_fingerprint(self) -> Hashable:
+        normalize_symbol_name_version = 1
+        return normalize_symbol_name_version
+
+    @override
+    def _normalize_symbol_name(self, symbol: RawDocumentSymbol, relative_file_path: str) -> str:
+        return symbol["name"].removeprefix("defp ").removeprefix("def ").split("(", 1)[0].strip()
+
+    def _find_mix_exs(self) -> str | None:
+        """
+        Find mix.exs in the repository.
+
+        Checks {repository_root_path}/mix.exs first (standard layout), then scans
+        immediate subdirectories for mix.exs (monorepo layout, e.g. server/mix.exs).
+        Returns the absolute path to the first match found, or None if not found.
+
+        Note: subdirectory iteration order depends on the filesystem (os.listdir).
+        In practice this is fine — monorepos typically have one Elixir app.
+        """
+        # Check root first
+        root_mix_exs = os.path.join(self.repository_root_path, "mix.exs")
+        if os.path.exists(root_mix_exs):
+            return root_mix_exs
+
+        # Search immediate subdirectories
+        try:
+            for entry in os.listdir(self.repository_root_path):
+                subdir_path = os.path.join(self.repository_root_path, entry)
+                if os.path.isdir(subdir_path):
+                    subdir_mix_exs = os.path.join(subdir_path, "mix.exs")
+                    if os.path.exists(subdir_mix_exs):
+                        log.info(f"Found mix.exs in subdirectory: {entry}/mix.exs")
+                        return subdir_mix_exs
+        except OSError as e:
+            log.warning(f"Error scanning for mix.exs in subdirectories: {e}")
+
+        return None
+
     @staticmethod
     def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:
         """
@@ -350,6 +390,29 @@ class ElixirTools(SolidLanguageServer):
 
         self.server.notify.initialized({})
 
+        # Expert's build pipeline is triggered by a textDocument/didOpen notification.
+        # Without it Expert sits idle and never emits the $/progress signals we wait for,
+        # causing a deadlock. Opening mix.exs is the minimal trigger; we close it again
+        # once the server is ready so it does not linger in the open-file set.
+        mix_exs_path = self._find_mix_exs()
+        mix_exs_uri: str | None = None
+
+        if mix_exs_path is not None:
+            mix_exs_uri = pathlib.Path(mix_exs_path).as_uri()
+            with open(mix_exs_path, encoding="utf-8") as f:
+                mix_exs_content = f.read()
+            self.server.notify.did_open_text_document(
+                {
+                    "textDocument": {
+                        "uri": mix_exs_uri,
+                        "languageId": "elixir",
+                        "version": 1,
+                        "text": mix_exs_content,
+                    }
+                }
+            )
+            log.debug("Opened mix.exs to trigger Expert's build pipeline")
+
         # Expert needs time to compile the project and build indexes on first run.
         # This can take 2-3+ minutes for mid-sized codebases.
         # After the first run, subsequent startups are much faster.
@@ -360,3 +423,7 @@ class ElixirTools(SolidLanguageServer):
         else:
             log.warning(f"Expert did not signal readiness within {ready_timeout}s. Proceeding with requests anyway.")
             self.server_ready.set()  # Mark as ready anyway to allow requests
+
+        if mix_exs_uri is not None:
+            self.server.notify.did_close_text_document({"textDocument": {"uri": mix_exs_uri}})
+            log.debug("Closed mix.exs after Expert is ready")

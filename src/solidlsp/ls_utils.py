@@ -10,6 +10,7 @@ import platform
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import uuid
 import zipfile
 from enum import Enum
@@ -115,6 +116,23 @@ class TextUtils:
         new_l, new_c = TextUtils._get_updated_position_from_line_and_column_and_edit(line, col, text_to_be_inserted)
         return new_text, new_l, new_c
 
+    @staticmethod
+    def get_text_in_range(text: str, start_line: int, start_col: int, end_line: int, end_col: int) -> str:
+        """
+        Returns the text between the given start and end positions.
+        """
+        start_idx = TextUtils.get_index_from_line_col(text, start_line, start_col)
+        end_idx = TextUtils.get_index_from_line_col(text, end_line, end_col)
+        return text[start_idx:end_idx]
+
+    @staticmethod
+    def get_text_in_lines_range(text: str, start_line: int, end_line: int) -> str:
+        """
+        Returns the text encompassed by the given start and end lines (inclusive).
+        """
+        lines = text.splitlines(keepends=True)
+        return "".join(lines[start_line : end_line + 1])
+
 
 class PathUtils:
     """
@@ -143,7 +161,7 @@ class PathUtils:
             urlparse = urlparse_py2
         parsed = urlparse(uri)
         host = f"{os.path.sep}{os.path.sep}{parsed.netloc}{os.path.sep}"
-        path = os.path.normpath(os.path.join(host, url2pathname(unquote(parsed.path))))
+        path = os.path.abspath(os.path.join(host, url2pathname(unquote(parsed.path))))
         return path
 
     @staticmethod
@@ -164,7 +182,7 @@ class PathUtils:
         Gets relative path if it's possible (paths should be on the same drive),
         returns `None` otherwise.
         """
-        if PurePath(path).drive == PurePath(base_path).drive:
+        if os.path.normcase(PurePath(path).drive) == os.path.normcase(PurePath(base_path).drive):
             rel_path = str(PurePath(os.path.relpath(path, base_path)))
             return rel_path
         return None
@@ -271,15 +289,15 @@ class FileUtils:
         """
         Downloads an archive from ``url`` and extracts it safely into ``target_path``.
         """
+        tmp_dir: str | None = None
         try:
             # preparing the temporary download location
-            tmp_files: list[str] = []
-            tmp_file_name = str(PurePath(os.path.expanduser("~"), "solidlsp_tmp", uuid.uuid4().hex))
-            os.makedirs(os.path.dirname(tmp_file_name), exist_ok=True)
+            external_tmp_files: list[str] = []
+            tmp_dir = tempfile.mkdtemp(prefix="solidlsp_")
+            tmp_file_name = os.path.join(tmp_dir, uuid.uuid4().hex)
 
             # downloading the archive with optional verification
             FileUtils.download_file_verified(url, tmp_file_name, expected_sha256=expected_sha256, allowed_hosts=allowed_hosts)
-            tmp_files.append(tmp_file_name)
 
             # extracting the archive according to its format
             if archive_type in ["tar", "gztar", "bztar", "xztar"]:
@@ -291,7 +309,6 @@ class FileUtils:
             elif archive_type == "zip.gz":
                 os.makedirs(target_path, exist_ok=True)
                 tmp_file_name_ungzipped = tmp_file_name + ".zip"
-                tmp_files.append(tmp_file_name_ungzipped)
                 with gzip.open(tmp_file_name, "rb") as f_in, open(tmp_file_name_ungzipped, "wb") as f_out:
                     shutil.copyfileobj(f_in, f_out)
                 FileUtils._extract_zip_archive(tmp_file_name_ungzipped, target_path)
@@ -299,7 +316,7 @@ class FileUtils:
                 target_directory = os.path.dirname(target_path) or "."
                 os.makedirs(target_directory, exist_ok=True)
                 temp_output_path = str(PurePath(target_directory, f".{Path(target_path).name}.{uuid.uuid4().hex}.extract"))
-                tmp_files.append(temp_output_path)
+                external_tmp_files.append(temp_output_path)
                 with gzip.open(tmp_file_name, "rb") as f_in, open(temp_output_path, "wb") as f_out:
                     shutil.copyfileobj(f_in, f_out)
                 os.replace(temp_output_path, target_path)
@@ -307,17 +324,21 @@ class FileUtils:
                 target_directory = os.path.dirname(target_path) or "."
                 os.makedirs(target_directory, exist_ok=True)
                 shutil.move(tmp_file_name, target_path)
-                tmp_files.remove(tmp_file_name)
             else:
                 log.error(f"Unknown archive type '{archive_type}' for extraction")
                 raise SolidLSPException(f"Unknown archive type '{archive_type}'")
         except Exception as exc:
-            log.error(f"Error extracting archive '{tmp_file_name}' obtained from '{url}': {exc}")
+            log.error(f"Error extracting archive obtained from '{url}': {exc}")
             raise SolidLSPException("Error extracting archive.") from exc
         finally:
-            for tmp_file_name in tmp_files:
-                if os.path.exists(tmp_file_name):
-                    Path.unlink(Path(tmp_file_name))
+            # cleaning up any temporary files outside the temporary directory
+            for tmp_file in external_tmp_files:
+                if os.path.exists(tmp_file):
+                    Path.unlink(Path(tmp_file))
+
+            # removing the temporary directory
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     @staticmethod
     def calculate_sha256(file_path: str) -> str:

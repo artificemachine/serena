@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterator, Sequence
 from logging import Logger
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import click
 from sensai.util import logging
@@ -17,11 +17,13 @@ from sensai.util.logging import FileLoggerContext, datetime_tag
 from sensai.util.string import dict_string
 from tqdm import tqdm
 
-from serena.agent import SerenaAgent
+from serena import serena_version
+from serena.config.client_setup import client_setup_handlers
 from serena.config.context_mode import SerenaAgentContext, SerenaAgentMode
 from serena.config.serena_config import (
     LanguageBackend,
     ModeSelectionDefinition,
+    ModeSelectionDefinitionWithAddedModes,
     ProjectConfig,
     RegisteredProject,
     SerenaConfig,
@@ -34,27 +36,30 @@ from serena.constants import (
     SERENAS_OWN_CONTEXT_YAMLS_DIR,
     SERENAS_OWN_MODE_YAMLS_DIR,
 )
-from serena.mcp import SerenaMCPFactory
-from serena.project import Project
-from serena.tools import FindReferencingSymbolsTool, FindSymbolTool, GetSymbolsOverviewTool, SearchForPatternTool, ToolRegistry
-from serena.util.dataclass import get_dataclass_default
+from serena.prompt_factory import SerenaPromptFactory
+from serena.util.cli_util import AutoRegisteringGroup
 from serena.util.logging import MemoryLogHandler
 from solidlsp.ls_config import Language
 from solidlsp.ls_types import SymbolKind
 from solidlsp.util.subprocess_util import subprocess_kwargs
 
+if TYPE_CHECKING:
+    from serena.memories.memory_manager import MemoryManager
+
 log = logging.getLogger(__name__)
 
-_MAX_CONTENT_WIDTH = 100
-_MODES_EXPLANATION = f"""\b\nBuilt-in mode names or paths to custom mode YAMLs with which to 
-override the default modes defined in the global Serena configuration or 
+_MAX_CONTENT_WIDTH = 200
+_MODES_EXPLANATION = """\b\nBuilt-in mode names or paths to custom mode YAMLs with which to 
+override the default_modes defined in the global Serena configuration or 
 the active project.
 For details on mode configuration, see 
   https://oraios.github.io/serena/02-usage/050_configuration.html#modes.
-If no configuration changes were made, the base defaults are: 
-  {get_dataclass_default(SerenaConfig, "default_modes")}.
-Overriding them means that they no longer apply, so you will need to 
-re-specify them in addition to further modes if you want to keep them."""
+"""
+_ADD_MODES_EXPLANATION = """\b\nMode names or paths to custom mode YAMLs which shall
+be added on top of the other modes specified by the global/project configuration.
+For details on mode configuration, see 
+  https://oraios.github.io/serena/02-usage/050_configuration.html#modes.
+"""
 
 
 def find_project_root(root: str | Path | None = None) -> str | None:
@@ -88,9 +93,6 @@ def find_project_root(root: str | Path | None = None) -> str | None:
             return str(directory)
 
     return None
-
-
-# --------------------- Utilities -------------------------------------
 
 
 def _open_in_editor(path: str) -> None:
@@ -128,32 +130,98 @@ class ProjectType(click.ParamType):
 PROJECT_TYPE = ProjectType()
 
 
-class AutoRegisteringGroup(click.Group):
-    """
-    A click.Group subclass that automatically registers any click.Command
-    attributes defined on the class into the group.
-
-    After initialization, it inspects its own class for attributes that are
-    instances of click.Command (typically created via @click.command) and
-    calls self.add_command(cmd) on each. This lets you define your commands
-    as static methods on the subclass for IDE-friendly organization without
-    manual registration.
-    """
-
-    def __init__(self, name: str, help: str):
-        super().__init__(name=name, help=help)
-        # Scan class attributes for click.Command instances and register them.
-        for attr in dir(self.__class__):
-            cmd = getattr(self.__class__, attr)
-            if isinstance(cmd, click.Command):
-                self.add_command(cmd)
-
-
 class TopLevelCommands(AutoRegisteringGroup):
     """Root CLI group containing the core Serena commands."""
 
     def __init__(self) -> None:
-        super().__init__(name="serena", help="Serena CLI commands. You can run `<command> --help` for more info on each command.")
+        super().__init__(
+            name="serena",
+            help="Main serena CLI commands. "
+            "Note that you also have access to `serena-hooks` CLI commands which are kept under "
+            "that separate entrypoint for performance reasons, see `serena-hooks --help`. You can run `<command> --help` for more info on each command.",
+        )
+
+        # register --version / -V flag
+        self.params.append(
+            click.Option(
+                ["--version", "-V"],
+                is_flag=True,
+                expose_value=False,
+                is_eager=True,
+                callback=self._print_version,
+                help="Show the version and exit.",
+            )
+        )
+
+    @staticmethod
+    def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+        """Print version string and exit if the flag is set."""
+        if not value:
+            return
+        click.echo(f"Serena {serena_version()}")
+        ctx.exit()
+
+    @staticmethod
+    @click.command(
+        "init",
+        help="Initialize Serena by creating a global config file with the specified default language backend.",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.option(
+        "--language-backend",
+        "-b",
+        type=click.Choice([b.value for b in LanguageBackend]),
+        default=LanguageBackend.LSP.value,
+        show_default=True,
+        help="Default code intelligence backend (can be overridden in the project config).",
+    )
+    def init(language_backend: Literal["LSP", "JetBrains"] = "LSP") -> None:
+        click.echo(f"\nSerena version: {serena_version()}\n")
+        serena_config = SerenaConfig.from_config_file()
+        serena_config.language_backend = LanguageBackend(language_backend)
+        serena_config.save()
+        click.echo(f"Configuration file: {serena_config.config_file_path}")
+        click.echo(f"Language backend: {language_backend}")
+
+        # check for auto-configurable clients
+        applicable_setup_handlers = []
+        for setup_handler in client_setup_handlers:
+            if setup_handler.is_applicable():
+                applicable_setup_handlers.append(setup_handler)
+        if len(applicable_setup_handlers) > 0:
+            click.echo(
+                "\nAuto-configurable clients detected.\nApply the following commands to configure the Serena MCP server (in a default configuration):"
+            )
+            for setup_handler in applicable_setup_handlers:
+                click.echo(f"  serena setup {setup_handler.name}")
+
+        click.echo("\nSerena has been initialised successfully.\n")
+
+    @staticmethod
+    @click.command(
+        "setup",
+        help="Set up Serena for use with a specific client by registering it as an MCP server.",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument(
+        "client",
+        type=click.Choice([h.name for h in client_setup_handlers]),
+    )
+    def setup(client: str) -> None:
+        # find the matching handler
+        handler = next(h for h in client_setup_handlers if h.name == client)
+
+        # check applicability
+        if not handler.is_applicable():
+            click.echo(f"\nCannot apply setup for client '{client}' (not found or not functional).\n")
+            raise SystemExit(1)
+
+        # apply the setup
+        if handler.apply():
+            click.echo(f"\nSerena has been successfully set up for {client}.\n")
+        else:
+            click.echo(f"\nFailed to set up Serena for {client}.\n")
+            raise SystemExit(1)
 
     @staticmethod
     @click.command("start-mcp-server", help="Starts the Serena MCP server.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH})
@@ -165,12 +233,21 @@ class TopLevelCommands(AutoRegisteringGroup):
     )
     @click.option(
         "--mode",
-        "modes",
+        "default_modes",
         type=str,
         multiple=True,
         default=(),
         show_default=False,
         help=_MODES_EXPLANATION,
+    )
+    @click.option(
+        "--add-mode",
+        "added_modes",
+        type=str,
+        multiple=True,
+        default=(),
+        show_default=False,
+        help=_ADD_MODES_EXPLANATION,
     )
     @click.option(
         "--language-backend",
@@ -219,12 +296,6 @@ class TopLevelCommands(AutoRegisteringGroup):
         help="Open Serena's dashboard in your browser after MCP server startup (overriding the setting in Serena's config).",
     )
     @click.option(
-        "--headless",
-        is_flag=True,
-        default=False,
-        help="[DEPRECATED] Alias for --open-web-dashboard false.",
-    )
-    @click.option(
         "--log-level",
         type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
         default=None,
@@ -243,19 +314,21 @@ class TopLevelCommands(AutoRegisteringGroup):
         project_file_arg: str | None,
         project_from_cwd: bool | None,
         context: str,
-        modes: Sequence[str],
+        default_modes: Sequence[str],
+        added_modes: Sequence[str],
         language_backend: str | None,
         transport: Literal["stdio", "sse", "streamable-http"],
         host: str,
         port: int,
         enable_web_dashboard: bool | None,
         open_web_dashboard: bool | None,
-        headless: bool,
         enable_gui_log_window: bool | None,
         log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None,
         trace_lsp_communication: bool | None,
         tool_timeout: float | None,
     ) -> None:
+        from serena.mcp import SerenaMCPFactory
+
         # initialize logging, using INFO level initially (will later be adjusted by SerenaAgent according to the config)
         #   * memory log handler (for use by GUI/Dashboard)
         #   * stream handler for stderr (for direct console output, which will also be captured by clients like Claude Desktop)
@@ -286,18 +359,17 @@ class TopLevelCommands(AutoRegisteringGroup):
             else:
                 log.warning("No project root found from %s; not activating any project", os.getcwd())
 
-        if headless:
-            if open_web_dashboard is True:
-                raise click.UsageError("--headless cannot be used with --open-web-dashboard true")
-            open_web_dashboard = False
-            log.warning("--headless is deprecated; use --open-web-dashboard false")
-
         project_file = project_file_arg or project
-        factory = SerenaMCPFactory(context=context, project=project_file, memory_log_handler=memory_log_handler)
+
+        mode_selection_def: ModeSelectionDefinition | None = None
+        if default_modes or added_modes:
+            mode_selection_def = ModeSelectionDefinitionWithAddedModes(default_modes=default_modes or None, added_modes=added_modes or None)
+
+        factory = SerenaMCPFactory(transport=transport, context=context, project=project_file, memory_log_handler=memory_log_handler)
         server = factory.create_mcp_server(
             host=host,
             port=port,
-            modes=modes,
+            mode_selection_def=mode_selection_def,
             language_backend=LanguageBackend.from_str(language_backend) if language_backend else None,
             enable_web_dashboard=enable_web_dashboard,
             open_web_dashboard=open_web_dashboard,
@@ -311,8 +383,24 @@ class TopLevelCommands(AutoRegisteringGroup):
                 "Positional project arg is deprecated; use --project instead. Used: %s",
                 project_file,
             )
+        # Ensure SIGTERM and SIGHUP trigger a clean SystemExit so the
+        # server_lifespan finally-block runs (agent.shutdown → LSP cleanup).
+        # Without this, Python's default SIGTERM disposition kills the process
+        # immediately and language-server children are orphaned.
+        import signal as _signal
+
+        def _handle_term(signum: int, frame: object) -> None:
+            log.info("Received signal %s — initiating graceful shutdown", signum)
+            raise SystemExit(0)
+
+        _signal.signal(_signal.SIGTERM, _handle_term)
+        _signal.signal(_signal.SIGHUP, _handle_term)
+
         log.info("Starting MCP server …")
-        server.run(transport=transport)
+        try:
+            server.run(transport=transport)
+        except (SystemExit, KeyboardInterrupt):
+            pass
 
     @staticmethod
     @click.command(
@@ -341,9 +429,10 @@ class TopLevelCommands(AutoRegisteringGroup):
     def print_system_prompt(
         project: str, log_level: str, only_instructions: bool, context: str, modes: Sequence[str] | None = None
     ) -> None:
+        from serena.agent import SerenaAgent
+
         prefix = "You will receive access to Serena's symbolic tools. Below are instructions for using them, take them into account."
         postfix = "You begin by acknowledging that you understood the above instructions and are ready to receive tasks."
-        from serena.tools.workflow_tools import InitialInstructionsTool
 
         lvl = logging.getLevelNamesMapping()[log_level.upper()]
         logging.configure(level=lvl)
@@ -351,14 +440,18 @@ class TopLevelCommands(AutoRegisteringGroup):
         modes_selection_def: ModeSelectionDefinition | None = None
         if modes:
             modes_selection_def = ModeSelectionDefinition(default_modes=modes)
+        serena_config = SerenaConfig.from_config_file()
+        serena_config.web_dashboard = False
+        print(serena_config.default_modes)
+        print(serena_config.base_modes)
+
         agent = SerenaAgent(
             project=os.path.abspath(project),
-            serena_config=SerenaConfig(web_dashboard=False, log_level=lvl),
+            serena_config=serena_config,
             context=context_instance,
             modes=modes_selection_def,
         )
-        tool = agent.get_tool(InitialInstructionsTool)
-        instr = tool.apply()
+        instr = agent.create_system_prompt()
         if only_instructions:
             print(instr)
         else:
@@ -428,11 +521,10 @@ class TopLevelCommands(AutoRegisteringGroup):
     @click.argument("url", type=str)
     @click.option("--width", type=int, default=1400, show_default=True, help="Window width.")
     @click.option("--height", type=int, default=900, show_default=True, help="Window height.")
-    @click.option("--minimized", is_flag=True, default=False, help="Whether to start minimized/in tray.")
-    def dashboard_viewer(url: str, width: int, height: int, minimized: bool) -> None:
+    def dashboard_viewer(url: str, width: int, height: int) -> None:
         from serena.dashboard import SerenaDashboardViewer
 
-        viewer = SerenaDashboardViewer(url, start_minimized=minimized, width=width, height=height)
+        viewer = SerenaDashboardViewer(url, width=width, height=height)
         viewer.run()
 
 
@@ -778,6 +870,8 @@ class ProjectCommands(AutoRegisteringGroup):
         :param path: The path to check.
         :param project: The path to the project directory, defaults to the current working directory.
         """
+        from serena.project import Project
+
         serena_config = SerenaConfig.from_config_file()
         proj = Project.load(os.path.abspath(project), serena_config=serena_config)
         if os.path.isabs(path):
@@ -801,6 +895,8 @@ class ProjectCommands(AutoRegisteringGroup):
         :param project: path to the project directory, defaults to the current working directory.
         :param verbose: if set, prints detailed information about the indexed symbols.
         """
+        from serena.project import Project
+
         serena_config = SerenaConfig.from_config_file()
         proj = Project.load(os.path.abspath(project), serena_config=serena_config)
         if os.path.isabs(file):
@@ -837,6 +933,10 @@ class ProjectCommands(AutoRegisteringGroup):
         :param project: path to the project directory, defaults to the current working directory.
         """
         # NOTE: completely written by Claude Code, only functionality was reviewed, not implementation
+        from serena.agent import SerenaAgent
+        from serena.project import Project
+        from serena.tools import FindReferencingSymbolsTool, FindSymbolTool, GetSymbolsOverviewTool, SearchForPatternTool
+
         logging.configure(level=logging.INFO)
         project_path = os.path.abspath(project)
         serena_config = SerenaConfig.from_config_file()
@@ -990,6 +1090,8 @@ class ToolCommands(AutoRegisteringGroup):
     @click.option("--all", "-a", "include_optional", is_flag=True, help="List all tools, including those not enabled by default.")
     @click.option("--only-optional", is_flag=True, help="List only optional tools (those not enabled by default).")
     def list(quiet: bool = False, include_optional: bool = False, only_optional: bool = False) -> None:
+        from serena.tools import ToolRegistry
+
         tool_registry = ToolRegistry()
         if quiet:
             if only_optional:
@@ -1012,6 +1114,9 @@ class ToolCommands(AutoRegisteringGroup):
     @click.argument("tool_name", type=str)
     @click.option("--context", type=str, default=None, help="Context name or path to context file.")
     def description(tool_name: str, context: str | None = None) -> None:
+        from serena.agent import SerenaAgent
+        from serena.mcp import SerenaMCPFactory
+
         # Load the context
         serena_context = None
         if context:
@@ -1027,6 +1132,282 @@ class ToolCommands(AutoRegisteringGroup):
         click.echo(mcp_tool.description)
 
 
+class MemoryCommands(AutoRegisteringGroup):
+    """Group for 'memories' subcommands; manage and inspect a project's memory files."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="memories",
+            help="Inspect, read, write, and validate Serena memories. "
+            "You can run `serena memories <command> --help` for more info on each command.",
+        )
+
+    @staticmethod
+    def _load_memories_manager(project: str) -> "MemoryManager":
+        """
+        Load the project at ``project`` and return its memories manager.
+
+        Requires the project to already be a Serena project (``.serena/project.yml`` must
+        exist at the configured location). Never auto-creates the ``.serena`` directory —
+        if no project configuration is found, the user is directed at ``serena project create``.
+        """
+        from serena.project import Project
+
+        serena_config = SerenaConfig.from_config_file()
+        project_path = os.path.abspath(project)
+        try:
+            proj = Project.load(project_path, serena_config=serena_config, autogenerate=False)
+        except FileNotFoundError as e:
+            raise click.UsageError(
+                f"{e}\nNo Serena project found at {project_path}. Create one first with:\n  serena project create {project_path}"
+            ) from e
+        return proj.memory_manager
+
+    @staticmethod
+    @click.command(
+        "initialize",
+        help=(
+            "Initialize this project's memory layout by seeding the `memory_maintenance` memory. "
+            "Requires the project to already exist as a Serena project (run `serena project create` first); "
+            "this command does not create a `.serena` directory on its own. "
+            "If a `global/memory_maintenance` memory exists, it takes precedence and no project copy is created."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    def initialize(project: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        name = manager.ensure_memory_maintenance_memory()
+        click.echo(f"Memory maintenance memory ready: `mem:{name}`.")
+
+    @staticmethod
+    @click.command(
+        "list",
+        help="List memories of the active project (and global memories).",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option("--topic", "-t", type=str, default="", help="Restrict the listing to a single topic (e.g. 'auth' or 'global/style').")
+    def list(project: str, topic: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        memories = manager.list_memories(topic=topic)
+        if not len(memories):
+            click.echo("(no memories found)")
+            return
+        if memories.memories:
+            click.echo("Project memories:")
+            for name in sorted(memories.memories):
+                click.echo(f"  - {name}")
+        if memories.read_only_memories:
+            click.echo("Read-only memories:")
+            for name in sorted(memories.read_only_memories):
+                click.echo(f"  - {name}")
+
+    @staticmethod
+    @click.command("read", help="Print the content of a memory to stdout.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH})
+    @click.argument("memory_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    def read(memory_name: str, project: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        click.echo(manager.load_memory(memory_name))
+
+    @staticmethod
+    @click.command(
+        "write",
+        help="Write a memory file. Reads the content from --content, --file, or stdin (in that order of precedence).",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("memory_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option("--content", type=str, default=None, help="Memory content provided directly on the command line.")
+    @click.option(
+        "--file", "file_path", type=click.Path(exists=True, dir_okay=False), default=None, help="Read memory content from the given file."
+    )
+    def write(memory_name: str, project: str, content: str | None, file_path: str | None) -> None:
+        if content is None and file_path is not None:
+            with open(file_path, encoding="utf-8") as f:
+                content = f.read()
+        if content is None:
+            content = sys.stdin.read()
+        manager = MemoryCommands._load_memories_manager(project)
+        click.echo(manager.save_memory(memory_name, content, is_tool_context=False))
+
+    @staticmethod
+    @click.command(
+        "delete",
+        help="Delete a memory file. Use the `global/` prefix to address a global memory (e.g. `global/style_guide`).",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("memory_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    def delete(memory_name: str, project: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        click.echo(manager.delete_memory(memory_name, is_tool_context=False))
+
+    @staticmethod
+    @click.command(
+        "rename",
+        help=(
+            "Rename or move a memory and update every `mem:OLD_NAME` reference across all memories. "
+            "Use `/` in the name to organize into topics; use the `global/` prefix to address a "
+            "global memory. Moving between project and global scope is supported."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("old_name", type=str)
+    @click.argument("new_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    def rename(old_name: str, new_name: str, project: str) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        message, n_refs = manager.rename_memory_and_propagate_references(old_name, new_name, is_tool_context=False)
+        click.echo(message)
+        if n_refs > 0:
+            click.echo(f"Updated {n_refs} `mem:` reference occurrence(s) across the memory graph.")
+
+    @staticmethod
+    @click.command(
+        "edit",
+        help=(
+            "Replace content matching a pattern in a memory. By default operates in literal "
+            "(non-regex) mode and refuses to replace more than one occurrence; pass --mode regex "
+            "to enable regex matching and --allow-multiple-occurrences to permit multiple hits."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("memory_name", type=str)
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option("--needle", type=str, required=True, help="The text to search for (literal by default; regex if --mode=regex).")
+    @click.option("--repl", type=str, required=True, help="The replacement text (verbatim).")
+    @click.option(
+        "--mode",
+        type=click.Choice(["literal", "regex"]),
+        default="literal",
+        show_default=True,
+        help="Treat --needle as literal text or as a Python regex (MULTILINE and DOTALL flags enabled).",
+    )
+    @click.option(
+        "--allow-multiple-occurrences",
+        is_flag=True,
+        default=False,
+        help="Permit and apply multiple matches; without this, multiple matches raise an error.",
+    )
+    def edit(
+        memory_name: str,
+        project: str,
+        needle: str,
+        repl: str,
+        mode: Literal["literal", "regex"],
+        allow_multiple_occurrences: bool,
+    ) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        click.echo(
+            manager.edit_memory(
+                memory_name,
+                needle,
+                repl,
+                mode,
+                allow_multiple_occurrences,
+                is_tool_context=False,
+            )
+        )
+
+    @staticmethod
+    @click.command(
+        "check",
+        help=(
+            "Check referential integrity across all memories of the project (and global memories). "
+            "By default reports only stale `mem:` references. Pass --include-unmarked to also report "
+            "bare occurrences of existing memory names (exact matches) and --fuzzy-matching (only "
+            "meaningful in combination with --include-unmarked) to additionally report fuzzy "
+            "near-misses. Read-only and never writes. Always exits 0."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option(
+        "--include-unmarked",
+        is_flag=True,
+        default=False,
+        help="Also report bare exact occurrences of existing memory names (i.e. without the `mem:` prefix).",
+    )
+    @click.option(
+        "--fuzzy-matching",
+        is_flag=True,
+        default=False,
+        help=(
+            "Additionally report fuzzy near-misses (long bare tokens that similarity-match an existing "
+            "memory name). Only meaningful together with --include-unmarked; ignored otherwise."
+        ),
+    )
+    def check(project: str, include_unmarked: bool, fuzzy_matching: bool) -> None:
+        if fuzzy_matching and not include_unmarked:
+            click.echo(
+                "Warning: --fuzzy-matching has no effect without --include-unmarked; ignoring it.",
+                err=True,
+            )
+        manager = MemoryCommands._load_memories_manager(project)
+        report = manager.validate_referential_integrity(
+            include_unmarked=include_unmarked,
+            include_fuzzy_matching=fuzzy_matching,
+        )
+        click.echo(report.format())
+
+    @staticmethod
+    @click.command(
+        "auto-prefix-references",
+        help=(
+            "Rewrite exact bare occurrences of existing memory names by adding the `mem:` prefix. "
+            "This is a heuristic, file-mutating operation: a word that happens to coincide with a memory name "
+            "will be rewritten as a reference even if it was intended as ordinary prose. "
+            "Use --dry-run to preview the rewrites without modifying any files. "
+            "\n\n"
+            "Scope is narrower than what `serena memories check` reports. Only EXACT bare occurrences are rewritten "
+            "(the body text must equal an existing memory name verbatim); fuzzy near-miss findings surfaced by `check` "
+            "are NOT autofixable here, since rewriting them would require substring substitution rather than a prefix "
+            "addition — they are reported for manual review. "
+            "By default the rewrite is further restricted to memory names containing `/` or longer than the configured "
+            "threshold, and skips global and read-only memories; use the --include-* flags below to widen the scope."
+        ),
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("project", type=click.Path(exists=True, file_okay=False, dir_okay=True), default=os.getcwd())
+    @click.option(
+        "--dry-run",
+        is_flag=True,
+        default=False,
+        help="Preview the rewrites this command would apply; do not modify any files.",
+    )
+    @click.option(
+        "--include-flat-names",
+        is_flag=True,
+        default=False,
+        help="Also rewrite short, flat memory names (no `/`, below the length threshold). Raises false-positive risk significantly.",
+    )
+    @click.option(
+        "--include-read-only",
+        is_flag=True,
+        default=False,
+        help="Also rewrite occurrences inside read-only memories.",
+    )
+    @click.option(
+        "--include-global",
+        is_flag=True,
+        default=False,
+        help="Also rewrite occurrences inside global memories (affects every project consuming them).",
+    )
+    def auto_prefix_references(
+        project: str, dry_run: bool, include_flat_names: bool, include_read_only: bool, include_global: bool
+    ) -> None:
+        manager = MemoryCommands._load_memories_manager(project)
+        report = manager.auto_prefix_bare_references(
+            include_flat_names=include_flat_names,
+            include_read_only=include_read_only,
+            include_global=include_global,
+            dry_run=dry_run,
+        )
+        click.echo(report.format())
+
+
 class PromptCommands(AutoRegisteringGroup):
     def __init__(self) -> None:
         super().__init__(name="prompts", help="Commands related to Serena's prompts that are outside of contexts and modes.")
@@ -1039,16 +1420,26 @@ class PromptCommands(AutoRegisteringGroup):
 
     @staticmethod
     @click.command(
-        "list", help="Lists yamls that are used for defining prompts.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH}
+        "list", help="Lists prompt names and YAML files that can be overridden.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH}
     )
     def list() -> None:
+        # list prompt names
+        click.echo("Prompts:")
+        factory = SerenaPromptFactory()
+        for key in factory.get_prompt_names():
+            template = factory.get_prompt_template(key)
+            is_overridden = not template.path.startswith(PROMPT_TEMPLATES_DIR_INTERNAL)
+            click.echo(f" * '{key}' ({template.path if is_overridden else 'default'})")
+
+        # list prompts files
+        click.echo("\nPrompt files (which you can override with the create-override command):")
         serena_prompt_yaml_names = [os.path.basename(f) for f in glob.glob(PROMPT_TEMPLATES_DIR_INTERNAL + "/*.yml")]
         for prompt_yaml_name in serena_prompt_yaml_names:
             user_prompt_yaml_path = PromptCommands._get_user_prompt_yaml_path(prompt_yaml_name)
             if os.path.exists(user_prompt_yaml_path):
-                click.echo(f"{user_prompt_yaml_path} merged with default prompts in {prompt_yaml_name}")
+                click.echo(f" * {user_prompt_yaml_path} merged with default prompts in {prompt_yaml_name}")
             else:
-                click.echo(prompt_yaml_name)
+                click.echo(f" * {prompt_yaml_name}")
 
     @staticmethod
     @click.command(
@@ -1121,24 +1512,38 @@ class PromptCommands(AutoRegisteringGroup):
         os.remove(user_prompt_yaml_path)
         click.echo(f"Deleted override file '{prompt_yaml_name}'.")
 
+    @staticmethod
+    @click.command(
+        "print-prompt-template",
+        help="prints the (unrendered) template for the corresponding prompt name. "
+        "This respects custom prompt yaml overrides and thus will print the value that will be used in Serena",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    @click.argument("prompt_name", type=str)
+    def print_prompt_template(prompt_name: str) -> None:
+        click.echo(SerenaPromptFactory().get_prompt_template_string(prompt_name))
 
-# Expose groups so we can reference them in pyproject.toml
-mode = ModeCommands()
-context = ContextCommands()
-project = ProjectCommands()
-config = SerenaConfigCommands()
-tools = ToolCommands()
-prompts = PromptCommands()
+    @staticmethod
+    @click.command(
+        "print-cc-system-prompt-override",
+        help="To be used specifically in Claude Code as value for `--system-prompt`",
+        context_settings={"max_content_width": _MAX_CONTENT_WIDTH},
+    )
+    def print_cc_system_prompt_override() -> None:
+        click.echo(SerenaPromptFactory().create_cc_system_prompt_override())
 
-# Expose toplevel commands for the same reason
+
+_mode = ModeCommands()
+_context = ContextCommands()
+_project = ProjectCommands()
+_config = SerenaConfigCommands()
+_tools = ToolCommands()
+_prompts = PromptCommands()
+_memories = MemoryCommands()
+
+# Expose so we can use this as an entrypoint
 top_level = TopLevelCommands()
-start_mcp_server = top_level.start_mcp_server
 
 # needed for the help script to work - register all subcommands to the top-level group
-for subgroup in (mode, context, project, config, tools, prompts):
+for subgroup in (_mode, _context, _project, _config, _tools, _prompts, _memories):
     top_level.add_command(subgroup)
-
-
-def get_help() -> str:
-    """Retrieve the help text for the top-level Serena CLI."""
-    return top_level.get_help(click.Context(top_level, info_name="serena"))

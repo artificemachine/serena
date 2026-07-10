@@ -1,0 +1,3 @@
+# Legitimate small binary assets from upstream, allowlisted per ~/.githooks/pre-commit check 1f.
+src/serena/resources/dashboard/serena-icon-1024-mac.png
+src/serena/resources/dashboard/serena-icon-tray-mac.png

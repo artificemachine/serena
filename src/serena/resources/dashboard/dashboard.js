@@ -296,6 +296,10 @@ class Dashboard {
         this.$availableContextsDisplay = $('#available-contexts-display');
         this.$addLanguageModal = $('#add-language-modal');
         this.$modalLanguageSelect = $('#modal-language-select');
+        this.$modalLanguageCombobox = $('#modal-language-combobox');
+        this.$modalLanguageOptions = $('#modal-language-options');
+        this.$modalLanguageEmpty = $('#modal-language-empty');
+        this.modalLanguageAvailable = [];
         this.$modalProjectName = $('#modal-project-name');
         this.$modalAddBtn = $('#modal-add-btn');
         this.$modalCancelBtn = $('#modal-cancel-btn');
@@ -360,6 +364,7 @@ class Dashboard {
         this.$modalAddBtn.click(this.addLanguageFromModal.bind(this));
         this.$modalCancelBtn.click(this.closeLanguageModal.bind(this));
         this.$modalClose.click(this.closeLanguageModal.bind(this));
+        this.bindLanguageCombobox();
         this.$removeModalOkBtn.click(this.confirmRemoveLanguageOk.bind(this));
         this.$removeModalCancelBtn.click(this.closeRemoveLanguageModal.bind(this));
         this.$modalCloseRemove.click(this.closeRemoveLanguageModal.bind(this));
@@ -485,32 +490,9 @@ class Dashboard {
 
         // Initialize the application
         this.loadToolNames().then(function () {
-            // Start on overview page
             self.loadNews();
-            self.loadConfigOverview();
-            self.startConfigPolling();
-            self.startExecutionsPolling();
-        });
-        // Initialize heartbeat interval
-        setInterval(this.heartbeat.bind(this), 250);
-    }
-
-    heartbeat() {
-        let self = this;
-        $.ajax({
-            url: '/heartbeat',
-            type: 'GET',
-            success: function (response) {
-                self.heartbeatFailureCount = 0;
-            },
-            error: function (xhr, status, error) {
-                self.heartbeatFailureCount++;
-                console.error('Heartbeat failure; count = ', self.heartbeatFailureCount);
-                if (self.heartbeatFailureCount >= 1) {
-                    console.log('Server appears to be down, closing tab');
-                    window.close();
-                }
-            },
+            // start on overview page
+            self.navigateToPage("overview");
         });
     }
 
@@ -541,7 +523,6 @@ class Dashboard {
         // Start appropriate polling for the page
         if (page === 'overview') {
             this.loadNews();
-            this.loadConfigOverview();
             this.startConfigPolling();
             this.startExecutionsPolling();
         } else if (page === 'logs') {
@@ -599,7 +580,8 @@ class Dashboard {
                 } else {
                     console.log('Config unchanged, skipping display update');
                 }
-            }, error: function (xhr, status, error) {
+            },
+            error: function (xhr, status, error) {
                 console.error('Error loading config overview:', error);
                 self.$configDisplay.html('<div class="error-message">Error loading configuration</div>');
                 self.$basicStatsDisplay.html('<div class="error-message">Error loading stats</div>');
@@ -607,24 +589,23 @@ class Dashboard {
                 self.$availableToolsDisplay.html('<div class="error-message">Error loading tools</div>');
                 self.$availableModesDisplay.html('<div class="error-message">Error loading modes</div>');
                 self.$availableContextsDisplay.html('<div class="error-message">Error loading contexts</div>');
-            }, complete: function () {
+            },
+            complete: function () {
                 self.waitingForConfigPollingResult = false;
             }
         });
     }
 
     startConfigPolling() {
+        this.loadConfigOverview();
         this.configPollInterval = setInterval(this.loadConfigOverview.bind(this), 1000);
     }
 
     startExecutionsPolling() {
+        this.loadExecutions()
         // Poll every 1 second for executions (independent of config polling)
         // This ensures stuck executions can still be cancelled even if config polling is blocked
-        this.loadExecutions()
-        this.executionsPollInterval = setInterval(() => {
-            this.loadQueuedExecutions();
-            this.loadLastExecution();
-        }, 1000);
+        this.executionsPollInterval = setInterval(this.loadExecutions.bind(this), 1000);
     }
 
     displayConfig(config) {
@@ -636,6 +617,8 @@ class Dashboard {
             const wasMemoriesExpanded = $existingMemoriesContent.is(':visible');
 
             let html = '<div class="config-grid">';
+
+            html += '<div class="config-label">Version:</div><div class="config-value">' + config.serena_version + '</div>';
 
             // Project info
             html += '<div class="config-label">Active Project:</div>';
@@ -701,10 +684,6 @@ class Dashboard {
             // File Encoding info
             html += '<div class="config-label">File Encoding:</div>';
             html += '<div class="config-value">' + (config.encoding || 'N/A') + '</div>';
-
-            // Current Client info
-            html += '<div class="config-label">Current Client:</div>';
-            html += '<div class="config-value">' + (config.current_client || 'None') + '</div>';
 
             html += '</div>';
 
@@ -869,7 +848,7 @@ class Dashboard {
 
         let html = '';
         tools.forEach(function (tool) {
-            html += '<div class="info-item" title="' + tool.name + '">' + tool.name + '</div>';
+            html += '<div class="info-item" title="' + tool.name + '"><code>' + tool.name + '</code></div>';
         });
 
         this.$availableToolsDisplay.html(html);
@@ -907,26 +886,30 @@ class Dashboard {
 
     // ===== Executions Methods =====
 
-    loadQueuedExecutions() {
+    loadQueuedExecutions(onComplete) {
         let self = this;
         $.ajax({
-            url: '/queued_task_executions', type: 'GET', success: function (response) {
+            url: '/queued_task_executions', type: 'GET',
+            success: function (response) {
                 if (response.status === 'success') {
                     self.displayActiveExecutionsQueue(response.queued_executions || []);
                 } else {
                     console.error('Error loading executions:', response.message);
                 }
-            }, error: function (xhr, status, error) {
+            },
+            error: function (xhr, status, error) {
                 console.error('Error loading executions:', error);
                 self.$activeExecutionQueueDisplay.html('<div class="error-message">Error loading executions</div>');
-            }
+            },
+            complete: onComplete
         });
     }
 
-    loadLastExecution() {
+    loadLastExecution(onComplete) {
         let self = this;
         $.ajax({
-            url: '/last_execution', type: 'GET', success: function (response) {
+            url: '/last_execution', type: 'GET',
+            success: function (response) {
                 if (response.status === 'success') {
                     if (response.last_execution !== null && response.last_execution.logged) {
                         self.displayLastExecution(response.last_execution);
@@ -934,21 +917,28 @@ class Dashboard {
                 } else {
                     console.error('Error loading last execution:', response.message);
                 }
-            }, error: function (xhr, status, error) {
+            },
+            error: function (xhr, status, error) {
                 console.error('Error loading last execution:', error);
                 self.$lastExecutionDisplay.html('<div class="error-message">Error loading last execution</div>');
-            }
+            },
+            complete: onComplete
         });
     }
 
     loadExecutions() {
+        const self = this;
         if (this.waitingForExecutionsPollingResult) {
             console.log('Still waiting for previous executions poll result, skipping this poll');
-        } else {
+        }
+        else {
             this.waitingForExecutionsPollingResult = true;
             console.log('Polling for executions...');
-            this.loadQueuedExecutions();
-            this.loadLastExecution();
+            this.loadQueuedExecutions(function() {
+                self.loadLastExecution(function() {
+                    self.waitingForExecutionsPollingResult = false;
+                });
+            });
         }
     }
 
@@ -1745,7 +1735,10 @@ class Dashboard {
 
     closeLanguageModal() {
         this.$addLanguageModal.fadeOut(200);
-        this.$modalLanguageSelect.empty();
+        this.closeLanguageDropdown();
+        this.$modalLanguageSelect.val('');
+        this.$modalLanguageOptions.empty();
+        this.modalLanguageAvailable = [];
         this.$modalAddBtn.prop('disabled', false).text('Add Language');
     }
 
@@ -1753,19 +1746,19 @@ class Dashboard {
         let self = this;
         $.ajax({
             url: '/get_available_languages', type: 'GET', success: function (response) {
-                const languages = response.languages || [];
-                // Clear all existing options
-                self.$modalLanguageSelect.empty();
+                const languages = (response.languages || []).slice().sort();
+                self.modalLanguageAvailable = languages;
+                self.$modalLanguageSelect.val('');
 
                 if (languages.length === 0) {
-                    // Show message if no languages available
-                    self.$modalLanguageSelect.append($('<option>').val('').text('No languages available to add'));
+                    self.$modalLanguageOptions.empty().hide();
+                    self.$modalLanguageEmpty.show();
+                    self.$modalLanguageSelect.prop('disabled', true).attr('placeholder', 'No languages available');
                     self.$modalAddBtn.prop('disabled', true);
                 } else {
-                    // Add language options
-                    languages.forEach(function (language) {
-                        self.$modalLanguageSelect.append($('<option>').val(language).text(language));
-                    });
+                    self.$modalLanguageEmpty.hide();
+                    self.$modalLanguageSelect.prop('disabled', false).attr('placeholder', 'Type to filter…');
+                    self.renderLanguageOptions('');
                     self.$modalAddBtn.prop('disabled', false);
                 }
             }, error: function (xhr, status, error) {
@@ -1774,12 +1767,141 @@ class Dashboard {
         });
     }
 
+    renderLanguageOptions(filter) {
+        const self = this;
+        const needle = (filter || '').toLowerCase();
+        const matches = this.modalLanguageAvailable.filter(function (lang) {
+            return lang.toLowerCase().includes(needle);
+        });
+
+        this.$modalLanguageOptions.empty();
+        if (matches.length === 0) {
+            this.$modalLanguageOptions.append(
+                $('<li class="no-match"></li>').text('No matches')
+            );
+        } else {
+            matches.forEach(function (lang, idx) {
+                let label = lang;
+                if (needle) {
+                    const i = lang.toLowerCase().indexOf(needle);
+                    if (i !== -1) {
+                        const before = lang.slice(0, i);
+                        const hit = lang.slice(i, i + needle.length);
+                        const after = lang.slice(i + needle.length);
+                        label = $('<span></span>')
+                            .append(document.createTextNode(before))
+                            .append($('<mark></mark>').text(hit))
+                            .append(document.createTextNode(after))
+                            .html();
+                    }
+                }
+                const $li = $('<li role="option"></li>')
+                    .attr('data-value', lang)
+                    .html(label);
+                if (idx === 0) {
+                    $li.addClass('highlighted');
+                }
+                $li.on('mousedown', function (e) {
+                    e.preventDefault(); // keep input focus
+                    self.selectLanguage(lang);
+                });
+                self.$modalLanguageOptions.append($li);
+            });
+        }
+    }
+
+    openLanguageDropdown() {
+        if (this.modalLanguageAvailable.length === 0) return;
+        this.renderLanguageOptions(this.$modalLanguageSelect.val());
+        this.$modalLanguageOptions.show();
+        this.$modalLanguageCombobox.addClass('open');
+    }
+
+    closeLanguageDropdown() {
+        this.$modalLanguageOptions.hide();
+        this.$modalLanguageCombobox.removeClass('open');
+    }
+
+    selectLanguage(lang) {
+        this.$modalLanguageSelect.val(lang);
+        this.closeLanguageDropdown();
+    }
+
+    moveLanguageHighlight(delta) {
+        const $items = this.$modalLanguageOptions.find('li:not(.no-match)');
+        if ($items.length === 0) return;
+        let idx = $items.index($items.filter('.highlighted'));
+        idx = (idx + delta + $items.length) % $items.length;
+        $items.removeClass('highlighted');
+        const $target = $items.eq(idx).addClass('highlighted');
+        const target = $target[0];
+        if (target && target.scrollIntoView) {
+            target.scrollIntoView({ block: 'nearest' });
+        }
+    }
+
+    bindLanguageCombobox() {
+        const self = this;
+        this.$modalLanguageSelect
+            .off('focus.combobox click.combobox input.combobox keydown.combobox')
+            .on('focus.combobox click.combobox', function () { self.openLanguageDropdown(); })
+            .on('input.combobox', function () {
+                self.renderLanguageOptions(self.$modalLanguageSelect.val());
+                self.openLanguageDropdown();
+            })
+            .on('keydown.combobox', function (e) {
+                const key = e.key;
+                if (key === 'ArrowDown') {
+                    e.preventDefault();
+                    if (self.$modalLanguageOptions.is(':visible')) {
+                        self.moveLanguageHighlight(1);
+                    } else {
+                        self.openLanguageDropdown();
+                    }
+                } else if (key === 'ArrowUp') {
+                    e.preventDefault();
+                    self.moveLanguageHighlight(-1);
+                } else if (key === 'Enter') {
+                    const $hl = self.$modalLanguageOptions.find('li.highlighted:not(.no-match)');
+                    if ($hl.length) {
+                        e.preventDefault();
+                        self.selectLanguage($hl.attr('data-value'));
+                    }
+                } else if (key === 'Escape') {
+                    if (self.$modalLanguageOptions.is(':visible')) {
+                        e.stopPropagation(); // don't close the modal
+                        self.closeLanguageDropdown();
+                    }
+                }
+            });
+
+        this.$modalLanguageCombobox
+            .off('click.caret')
+            .on('click.caret', '.combobox-caret', function () {
+                self.$modalLanguageSelect.trigger('focus');
+                self.openLanguageDropdown();
+            });
+
+        $(document).off('mousedown.langCombobox').on('mousedown.langCombobox', function (e) {
+            if (!self.$modalLanguageCombobox.is(':visible')) return;
+            if (!$.contains(self.$modalLanguageCombobox[0], e.target)) {
+                self.closeLanguageDropdown();
+            }
+        });
+    }
+
     addLanguageFromModal() {
-        const selectedLanguage = this.$modalLanguageSelect.val();
-        if (!selectedLanguage) {
-            alert('No language selected or no languages available to add');
+        const typed = (this.$modalLanguageSelect.val() || '').trim();
+        const matched = this.modalLanguageAvailable.find(function (l) {
+            return l.toLowerCase() === typed.toLowerCase();
+        });
+        if (!matched) {
+            alert(typed
+                ? 'Unknown language: ' + typed + '. Pick one from the dropdown.'
+                : 'No language selected.');
             return;
         }
+        const selectedLanguage = matched;
 
         const self = this;
 
@@ -2073,31 +2195,36 @@ class Dashboard {
         let self = this;
         console.log('Loading news...');
         $.ajax({
-            url: '/news_snippet_ids',
+            url: '/fetch_unread_news',
             type: 'GET',
             success: function(response) {
-                console.log('News snippet IDs response:', response);
-                if (response.status === 'success' && response.news_snippet_ids && response.news_snippet_ids.length > 0) {
-                    console.log('Displaying news with IDs:', response.news_snippet_ids);
-                    self.displayNews(response.news_snippet_ids);
+                console.log('Unread news response:', response);
+                if (response.status === 'success' && response.news && Object.keys(response.news).length > 0) {
+                    const newsIds = Object.keys(response.news);
+                    self.displayNews(newsIds, response.news);
                 } else {
                     console.log('No unread news, hiding section');
                     self.$newsSection.hide();
                 }
             },
             error: function(xhr, status, error) {
-                console.error('Error loading news snippet IDs:', error);
+                console.error('Error loading news:', error);
                 self.$newsSection.hide();
             }
         });
     }
 
-    displayNews(newsIds) {
+    /**
+     * Display news items given unread IDs and the full news data mapping.
+     * @param {number[]} newsIds - array of unread news IDs
+     * @param {Object} newsData - mapping of news ID strings to HTML content
+     */
+    displayNews(newsIds, newsData) {
         let self = this;
         console.log('displayNews called with:', newsIds);
         // Sort newest first (descending order)
         newsIds.sort((a, b) => b - a);
-        
+
         if (newsIds.length === 0) {
             console.log('No news items to display.');
             self.$newsSection.hide();
@@ -2106,40 +2233,32 @@ class Dashboard {
         self.$newsSection.show();
         self.$newsDisplay.empty();
         console.log('Displaying ' + newsIds.length + ' news items.');
-        // Load each news snippet HTML
-        let loadedCount = 0;
-        newsIds.forEach(function(newsId) {
-            $.ajax({
-                url: '/dashboard/news/' + newsId + '.html',
-                type: 'GET',
-                success: function(html) {
-                    // Wrap the HTML in a container with a button
-                    let $newsContainer = $('<div class="news-container">').attr('data-news-id', newsId);
-                    let $newsContent = $(html);
-                    
-                    // Add button for marking as read
-                    let $markRead = $('<div class="news-mark-read">');
-                    let $button = $('<button class="news-mark-read-btn">').attr('data-news-id', newsId).text('Mark as read');
 
-                    $markRead.append($button);
-                    $newsContent.append($markRead);
-                    
-                    $newsContainer.append($newsContent);
-                    self.$newsDisplay.append($newsContainer);
-                    
-                    // Bind button click event
-                    $button.on('click', function() {
-                        const btn = $(this);
-                        btn.prop('disabled', true).text('Marking...');
-                        self.markNewsAsRead(newsId);
-                    });
-                    
-                    loadedCount++;
-                },
-                error: function(xhr, status, error) {
-                    console.error('Error loading news snippet ' + newsId + ':', error);
-                    loadedCount++;
-                }
+        newsIds.forEach(function(newsId) {
+            const html = newsData[String(newsId)];
+            if (!html) {
+                console.warn('No news content found for ID ' + newsId);
+                return;
+            }
+            // Wrap the HTML in a container with a button
+            let $newsContainer = $('<div class="news-container">').attr('data-news-id', newsId);
+            let $newsContent = $(html);
+
+            // Add button for marking as read
+            let $markRead = $('<div class="news-mark-read">');
+            let $button = $('<button class="news-mark-read-btn">').attr('data-news-id', newsId).text('Mark as read');
+
+            $markRead.append($button);
+            $newsContent.append($markRead);
+
+            $newsContainer.append($newsContent);
+            self.$newsDisplay.append($newsContainer);
+
+            // Bind button click event
+            $button.on('click', function() {
+                const btn = $(this);
+                btn.prop('disabled', true).text('Marking...');
+                self.markNewsAsRead(newsId);
             });
         });
     }

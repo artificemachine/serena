@@ -3,7 +3,7 @@ The Serena Model Context Protocol (MCP) Server
 """
 
 import sys
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -52,14 +52,22 @@ class SerenaMCPFactory:
     Factory for the creation of the Serena MCP server with an associated SerenaAgent.
     """
 
-    def __init__(self, context: str = DEFAULT_CONTEXT, project: str | None = None, memory_log_handler: MemoryLogHandler | None = None):
+    def __init__(
+        self,
+        transport: Literal["stdio", "sse", "streamable-http"],
+        context: str = DEFAULT_CONTEXT,
+        project: str | None = None,
+        memory_log_handler: MemoryLogHandler | None = None,
+    ):
         """
+        :param transport: The transport to use for the MCP server.
         :param context: The context name or path to context file
         :param project: Either an absolute path to the project directory or a name of an already registered project.
             If the project passed here hasn't been registered yet, it will be registered automatically and can be activated by its name
             afterward.
         :param memory_log_handler: the in-memory log handler to use for the agent's logging
         """
+        self.transport = transport
         self.context = SerenaAgentContext.load(context)
         self.project = project
         self.agent: SerenaAgent | None = None
@@ -272,7 +280,7 @@ class SerenaMCPFactory:
         self,
         host: str = "127.0.0.1",
         port: int = 8000,
-        modes: Sequence[str] = (),
+        mode_selection_def: ModeSelectionDefinition | None = None,
         language_backend: LanguageBackend | None = None,
         enable_web_dashboard: bool | None = None,
         enable_gui_log_window: bool | None = None,
@@ -286,7 +294,7 @@ class SerenaMCPFactory:
 
         :param host: The host to bind to
         :param port: The port to bind to
-        :param modes: List of mode names or paths to mode files
+        :param mode_selection_def: the mode selection definition to apply
         :param language_backend: the language backend to use, overriding the configuration setting.
         :param enable_web_dashboard: Whether to enable the web dashboard. If not specified, will take the value from the serena configuration.
         :param enable_gui_log_window: Whether to enable the GUI log window. It currently does not work on macOS, and setting this to True will be ignored then.
@@ -318,9 +326,6 @@ class SerenaMCPFactory:
             if language_backend is not None:
                 config.language_backend = language_backend
 
-            mode_selection_def: ModeSelectionDefinition | None = None
-            if modes:
-                mode_selection_def = ModeSelectionDefinition(default_modes=modes)
             self.agent = self._create_serena_agent(config, mode_selection_def)
 
         except Exception as e:
@@ -332,22 +337,41 @@ class SerenaMCPFactory:
         # retain only FASTMCP_ prefix for already set environment variables.
         Settings.model_config = SettingsConfigDict(env_prefix="FASTMCP_")
         instructions = self._get_initial_instructions()
-        mcp = FastMCP(lifespan=self.server_lifespan, host=host, port=port, instructions=instructions)
+        log.info("MCP server initial instructions:\n%s", instructions)
+        mcp = FastMCP(
+            name="Serena",
+            lifespan=self.server_lifespan,
+            website_url="https://oraios.github.io/serena",
+            host=host,
+            port=port,
+            instructions=instructions,
+        )
         return mcp
 
     @asynccontextmanager
     async def server_lifespan(self, mcp_server: FastMCP) -> AsyncIterator[None]:
-        """Manage server startup and shutdown lifecycle."""
+        """
+        Manages the lifespan of MCP server instances and performs necessary setup and teardown.
+        For stdio transport, there is a single server instance.
+        For other transports, this is called once per connection!
+
+        :param mcp_server: the MCP server instance to configure
+        """
         openai_tool_compatible = self.context.name in ["chatgpt", "codex", "oaicompat-agent"]
         self._set_mcp_tools(mcp_server, openai_tool_compatible=openai_tool_compatible)
         log.info("MCP server lifetime setup complete")
         try:
             yield
         finally:
-            log.info("MCP server shutting down")
-            if self.agent is not None:
-                self.agent.shutdown()
+            # Shut down the server if we are running in stdio mode.
+            # For other transports, we do nothing; the singleton agent instance remains active.
+            if self.transport == "stdio":
+                log.info("MCP server shutting down")
+                if self.agent is not None:
+                    self.agent.on_shutdown()
+            else:
+                log.info("Client disconnected")
 
     def _get_initial_instructions(self) -> str:
         assert self.agent is not None
-        return self.agent.create_system_prompt()
+        return self.agent.create_connection_prompt()
