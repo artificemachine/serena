@@ -4,10 +4,10 @@ Provides TypeScript specific instantiation of the LanguageServer class. Contains
 
 import logging
 import os
-import pathlib
 import shutil
 import threading
-from typing import Any, cast
+import time
+from typing import Any
 
 from overrides import override
 from sensai.util.logging import LogTime
@@ -16,7 +16,6 @@ from solidlsp import ls_types
 from solidlsp.ls import LanguageServerDependencyProvider, LanguageServerDependencyProviderSinglePath, SolidLanguageServer
 from solidlsp.ls_config import LanguageServerConfig
 from solidlsp.ls_utils import PlatformId, PlatformUtils
-from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.settings import SolidLSPSettings
 
 from .common import RuntimeDependency, RuntimeDependencyCollection, build_npm_install_command
@@ -36,7 +35,7 @@ if os.name != "nt":  # Unix-like systems
     import pwd
 else:
     # Dummy pwd module for Windows
-    class pwd:  # type: ignore
+    class pwd:
         @staticmethod
         def getpwuid(uid: Any) -> Any:
             return type("obj", (), {"pw_name": os.environ.get("USERNAME", "unknown")})()
@@ -73,6 +72,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
     You can pass the following entries in ls_specific_settings["typescript"]:
         - typescript_version: Version of TypeScript to install (default: "5.9.3")
         - typescript_language_server_version: Version of typescript-language-server to install (default: "5.1.3")
+        - indexing_timeout: float, timeout in seconds for project indexing (default: 30.0)
     """
 
     @classmethod
@@ -81,7 +81,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
 
     # Safety timeout for $/progress-based indexing wait. Normally the event fires
     # well within this window; the timeout is only hit if the server never sends progress.
-    INDEXING_PROGRESS_TIMEOUT = 15.0 if os.name == "nt" else 10.0
+    INDEXING_PROGRESS_TIMEOUT = 30.0
 
     def __init__(self, config: LanguageServerConfig, repository_root_path: str, solidlsp_settings: SolidLSPSettings):
         """
@@ -224,13 +224,18 @@ class TypeScriptLanguageServer(SolidLanguageServer):
             return "javascriptreact"
         return self.language_id
 
-    def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
-        """
-        Returns the initialize params for the TypeScript Language Server.
-        """
-        root_uri = pathlib.Path(repository_absolute_path).as_uri()
+    def _create_base_initialize_params(self) -> dict:
         initialize_params = {
             "locale": "en",
+            # Disable Automatic Type Acquisition (ATA): with ATA enabled, tsserver fetches
+            # @types/* packages from npm in the background during indexing, which makes startup
+            # slow, network-dependent, and nondeterministic (and can hang on offline/locked-down
+            # machines). Serena relies on the types already installed in the project instead.
+            "initializationOptions": {
+                "preferences": {
+                    "disableAutomaticTypingAcquisition": True,
+                },
+            },
             "capabilities": {
                 "textDocument": {
                     "synchronization": {"didSave": True, "dynamicRegistration": True},
@@ -258,12 +263,8 @@ class TypeScriptLanguageServer(SolidLanguageServer):
                     "workDoneProgress": True,  # Enables $/progress notifications for project loading
                 },
             },
-            "processId": os.getpid(),
-            "rootPath": repository_absolute_path,
-            "rootUri": root_uri,
-            "workspaceFolders": self._build_workspace_folders_param(repository_absolute_path),
         }
-        return cast(InitializeParams, initialize_params)
+        return initialize_params
 
     def _start_server(self) -> None:
         """
@@ -366,7 +367,7 @@ class TypeScriptLanguageServer(SolidLanguageServer):
 
         log.info("Starting TypeScript server process")
         self.server.start()
-        initialize_params = self._get_initialize_params(self.repository_root_path)
+        initialize_params = self._create_initialize_params()
 
         log.info(
             "Sending initialize request from LSP client to LSP server and awaiting response",
@@ -393,13 +394,14 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         # typescript-language-server may send $/progress for "Initializing JS/TS
         # language features…" after initialized. If no progress is sent,
         # _indexing_complete stays SET and wait() returns immediately.
+        indexing_timeout = self._custom_settings.get("indexing_timeout", self.INDEXING_PROGRESS_TIMEOUT)
         log.info("Waiting for TypeScript project indexing to complete (if async)...")
-        if self.wait_for_indexing(timeout=self.INDEXING_PROGRESS_TIMEOUT):
+        if self.wait_for_indexing(timeout=indexing_timeout):
             log.info("TypeScript project indexing complete")
         else:
             log.warning(
                 "TypeScript project indexing did not complete within %.0fs; proceeding anyway",
-                self.INDEXING_PROGRESS_TIMEOUT,
+                indexing_timeout,
             )
 
         self._activate_additional_workspaces()
@@ -456,8 +458,32 @@ class TypeScriptLanguageServer(SolidLanguageServer):
         return self._published_diagnostics_timeout
 
     @override
-    def _get_wait_time_for_cross_file_referencing(self) -> float:
-        return 2
+    def _pre_open_for_cross_file_references(self) -> None:
+        if not self._has_waited_for_cross_file_references:
+            self.expect_indexing()
+
+    #: how long to wait for tsserver to *start* reporting indexing progress after didOpen;
+    #: matches the fixed wait the base implementation previously used
+    _INDEXING_START_GRACE_S = 2.0
+
+    @override
+    def _wait_for_cross_file_references_if_needed(self) -> None:
+        if self._has_waited_for_cross_file_references:
+            return
+        # Give tsserver a short grace period to start reporting $/progress after the file
+        # was opened. If progress starts, wait until it drains (bounded by indexing_timeout);
+        # if it never starts, tsserver considers the project loaded and we proceed after the
+        # grace period — which is no worse than the previous fixed 2-second wait.
+        grace_deadline = time.monotonic() + self._INDEXING_START_GRACE_S
+        while time.monotonic() < grace_deadline and not self._indexing_complete.is_set() and not self._active_progress_tokens:
+            time.sleep(0.05)
+        if self._active_progress_tokens:
+            timeout = self._custom_settings.get("indexing_timeout", self.INDEXING_PROGRESS_TIMEOUT)
+            if self.wait_for_indexing(timeout=timeout):
+                log.info("TypeScript cross-file indexing complete")
+            else:
+                log.warning("TypeScript cross-file indexing did not complete within %.0fs; proceeding", timeout)
+        self._has_waited_for_cross_file_references = True
 
     @override
     def _get_preferred_definition(self, definitions: list[ls_types.Location]) -> ls_types.Location:

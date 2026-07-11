@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import platform
 import socket
 import subprocess
 import threading
@@ -11,7 +10,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import IO, Any, AnyStr
+from typing import IO, Any, AnyStr, cast
 
 from sensai.util.string import ToStringMixin
 
@@ -33,7 +32,7 @@ from solidlsp.lsp_protocol_handler.server import (
     make_request,
     make_response,
 )
-from solidlsp.util.subprocess_util import quote_arg, subprocess_kwargs, terminate_process_tree_with_kill_fallback
+from solidlsp.util import subprocess_util
 
 log = logging.getLogger(__name__)
 
@@ -459,33 +458,34 @@ class StdioLanguageServer(LanguageServerInterface):
         child_proc_env = os.environ.copy()
         child_proc_env.update(self.process_launch_info.env)
 
-        cmd = self.process_launch_info.cmd
-        is_windows = platform.system() == "Windows"
-        if not isinstance(cmd, str) and not is_windows:
-            # Since we are using the shell, we need to convert the command list to a single string
-            # on Linux/macOS
-            cmd = " ".join(map(quote_arg, cmd))
+        cmd = subprocess_util.convert_shell_cmd(self.process_launch_info.cmd)
         log.info("Starting language server process via command: %s", self.process_launch_info.cmd)
-        kwargs = subprocess_kwargs()
+        kwargs = subprocess_util.subprocess_kwargs()
         kwargs["start_new_session"] = self.start_independent_lsp_process
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stdin=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_proc_env,
-            cwd=self.process_launch_info.cwd,
-            shell=True,
-            **kwargs,
+        # the language server is launched with binary (bytes) pipes; the cast is needed because the
+        # presence of platform-specific **kwargs prevents ty from selecting the bytes Popen overload
+        process = cast(
+            "subprocess.Popen[bytes]",
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_proc_env,
+                cwd=self.process_launch_info.cwd,
+                shell=True,
+                **kwargs,
+            ),
         )
+        self.process = process
 
         # Check if process terminated immediately
-        if self.process.returncode is not None:
+        if process.returncode is not None:
             log.error("Language server has already terminated/could not be started")
             # Process has already terminated
-            stderr_data = self.process.stderr.read() if self.process.stderr else b""
+            stderr_data = process.stderr.read() if process.stderr else b""
             error_message = stderr_data.decode("utf-8", errors="replace")
-            raise RuntimeError(f"Process terminated immediately with code {self.process.returncode}. Error: {error_message}")
+            raise RuntimeError(f"Process terminated immediately with code {process.returncode}. Error: {error_message}")
 
         # start threads to read stdout and stderr of the process
         threading.Thread(
@@ -513,7 +513,9 @@ class StdioLanguageServer(LanguageServerInterface):
                 log.debug(f"Exception during graceful shutdown: {e}")
                 # Ignore errors here, we are proceeding to terminate anyway.
             # terminate the process
-            terminate_process_tree_with_kill_fallback(self.process, terminate_timeout=timeout, process_name=f"LS[{self.language.value}]")
+            subprocess_util.terminate_process_tree_with_kill_fallback(
+                self.process, terminate_timeout=timeout, process_name=f"LS[{self.language.value}]"
+            )
         finally:
             self.process = None
 
@@ -526,7 +528,7 @@ class StdioLanguageServer(LanguageServerInterface):
             except Exception:
                 pass
 
-    def _read_bytes_from_process(self, process, stream, num_bytes) -> bytes:  # type: ignore
+    def _read_bytes_from_process(self, process, stream, num_bytes) -> bytes:
         """Read exactly num_bytes from process stdout"""
         data = b""
         while len(data) < num_bytes:
