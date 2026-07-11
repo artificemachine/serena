@@ -105,7 +105,12 @@ class JetBrainsPluginClientManager:
                 futures.append(future)
         return futures
 
-    def find_client(self, project_root: Path) -> "JetBrainsPluginClient":
+    def find_client(self, project_root: Path, log_warning: bool = True) -> "JetBrainsPluginClient":
+        """
+        :param project_root: the project root path to find a plugin instance for
+        :param log_warning: whether to log a warning if no matching plugin instance is found
+        :return: the instance
+        """
         plugin_paths_found = []
         for future in self._submit_scan():
             client = future.result()
@@ -114,12 +119,13 @@ class JetBrainsPluginClientManager:
             elif client.project_root is not None:
                 plugin_paths_found.append(client.project_root)
 
-        log.warning(
-            "Searched for Serena JetBrains plugin service for project at %s but found no matching service. "
-            "Found plugin instances for the following project paths: %s",
-            project_root,
-            plugin_paths_found,
-        )
+        if log_warning:
+            log.warning(
+                "Searched for Serena JetBrains plugin service for project at %s but found no matching service. "
+                "Found plugin instances for the following project paths: %s",
+                project_root,
+                plugin_paths_found,
+            )
         raise ServerNotFoundError(
             f"Found no Serena service in a JetBrains IDE instance for the project at {project_root}. "
             "STOP. Do not attempt any other tools or workarounds. Ask the user to open this folder as a project in a JetBrains IDE "
@@ -219,7 +225,7 @@ class JetBrainsPluginClient(ToStringMixin):
         return ["_port", "project_root", "_plugin_version"]
 
     @classmethod
-    def from_project(cls, project: Project) -> Self:
+    def from_project(cls, project: Project, log_warning: bool = True) -> "JetBrainsPluginClient":
         resolved_path = Path(project.project_root).resolve()
 
         if cls._last_port is not None:
@@ -227,7 +233,7 @@ class JetBrainsPluginClient(ToStringMixin):
             if client.matches(resolved_path):
                 return client
 
-        client = JetBrainsPluginClientManager().find_client(resolved_path)
+        client = JetBrainsPluginClientManager().find_client(resolved_path, log_warning=log_warning)
         cls._last_port = client._port
         return client
 
@@ -305,8 +311,8 @@ class JetBrainsPluginClient(ToStringMixin):
             if method.upper() == "GET":
                 response = self._session.get(url, timeout=self._timeout)
             elif method.upper() == "POST":
-                json_data = json.dumps(data) if data else None
-                response = self._session.post(url, data=json_data, timeout=self._timeout)
+                data_dict = data if data is not None else {}
+                response = self._session.post(url, data=json.dumps(data_dict), timeout=self._timeout)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
 
@@ -349,7 +355,7 @@ class JetBrainsPluginClient(ToStringMixin):
         """
         to_snake_case = lambda s: "".join(["_" + c.lower() if c.isupper() else c for c in s])
 
-        def convert(x):  # type: ignore
+        def convert(x):
             if isinstance(x, dict):
                 return {to_snake_case(k): convert(v) for k, v in x.items()}
             elif isinstance(x, list):
@@ -715,5 +721,5 @@ class JetBrainsPluginClient(ToStringMixin):
     def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):  # type: ignore
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()

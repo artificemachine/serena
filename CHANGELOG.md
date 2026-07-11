@@ -2,6 +2,27 @@
 
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
+## Incremental sync with upstream/main (v1.5.3 to 065df5ea, 147 commits)
+
+Merged cleanly (no tree-merge needed — v1.5.3 was already a real git ancestor
+of this branch). Two conflicts:
+
+- `memories/memory_manager.py`: upstream independently added its own
+  containment check (`_resolve_memory_path`), deliberately lexical (no
+  symlink resolution) to support a new feature — symlinked memory
+  directories for monorepo sharing (commit `310a01c1`, "Make memory
+  iteration follow symbolic links"). This is incompatible with S-2's
+  stricter symlink-escape rejection below. Adopted upstream's version;
+  S-2's symlink-escape test was replaced with a test asserting the new
+  supported behavior (symlinked memory dirs resolve to their target).
+  The dotdot-segment check is unaffected.
+- `CHANGELOG.md`: both sides added content at the same insertion point,
+  kept both.
+
+`util/shell.py`'s S-1 guard and `cli.py`'s graceful-shutdown handler merged
+clean with no conflict (S-1 now sits alongside an apparently convergent
+upstream implementation of the identical check, tagged `SEC-002`).
+
 ## celstnblacc/serena fork sync (v0.1.6 to v1.5.3)
 
 * Security (re-applied from the pre-sync fork):
@@ -25,7 +46,114 @@ Status of the `main` branch. Changes prior to the next official version change w
       document symbols, hover, and diagnostics. Works best with a `foundry.toml` or
       `hardhat.config.js` in the project root.
 
+* General:
+  - Add notion of trusted projects via new global configuration setting `trusted_project_path_patterns`.
+    Current effects:
+    - `ls_specific_settings` defined in project configurations will only be applied for trusted projects
+    - `activation_command` (and `activation_command_timeout`) defined in project configurations will only
+      be executed for trusted projects: an optional shell command run in the project root before the
+      language backend initialises (e.g. to generate source files a language server needs to index).
+      Exit code is the primary completion signal; `activation_command_timeout` (default 180s) is a safety
+      backstop — on expiry the process is killed and activation continues. Failures and timeouts are
+      logged but do not abort activation.
+  - Fix: context or mode argument referencing a known name (e.g. `--context anitgravity`) could result in   
+    incorrect file access if a corresponding local file existed (e.g. `./antigravity` binary);
+    file access is now guarded with path detection (file ending or path separator must be present)
+  - Adjust prompt generation mechanism to use newly introduced tool name mapping `tool_names`, allowing
+    prompts to directly use tool names that match the active language backend (and removing the need
+    for additional prompts that explain tool name differences)
+  - Improve quoting/escaping of arguments in shell executions on Windows (via `oslex` dependency)
+  - Fix: a registered project whose root directory was deleted while Serena was already running could break
+    `activate_project`/project lookup, raising `FileNotFoundError` in `RegisteredProject.matches_root_path`
+  - Update prompts/instructions: Serena instructions manual, modes (editing, interactive) 
+  - Allow structured tool output to be configured on a per-context basis, disabling it for Claude Code
+    (which does not correctly unpack structured output) #1042
+  - Fix: Project-specific filtering of files for source files ignored the language backend. 
+    The check is really only possible for LSP. 
+  - Fix: File system permission errors during gitignore scanning were not caught #1624
+  - During project creation, language composition percentages are now computed relative to the total number 
+    of recognised source files instead of all files, i.e. unrecognised files are ignored in the percentage 
+    computation.
+
+* CLI:
+  - Fix `--project-from-cwd` hijacking git worktrees nested under a Serena project. `find_project_root`
+    now walks up in a single pass so the nearest project boundary wins (either a `.serena/project.yml`
+    or a `.git`, including worktree/submodule pointer files), instead of preferring an ancestor's
+    `.serena/project.yml` over a closer `.git`. This previously bound CLI agents (Claude Code, Codex,
+    Gemini) launched from inside a worktree to the parent repo, causing stale reads and misdirected edits.
+  - Fix: CLI flags on `start-mcp-server` could incorrectly be saved to the global configuration file if the
+    list of projects was modified (triggering a save of the configuration with transient overrides applied)
+
+* Tools:
+  - New tool: `replace_in_files`
+  - `get_symbols_overview`, `jet_brains_get_symbols_overview`: Improved default for `depth` parameter
+  - Add tool parameter alias support, adding `name_path` as an alias for `name_path_pattern` in `find_symbol` tools
+  - Allow `query_project` tool to access read-only tools that are not enabled in the current configuration
+  - Make tool call errors surface explicitly as errors at the MCP protocol level
+
+* Language Servers:
+  - C/C++ (clangd): improve support and documentation for Unreal Engine 5 projects.
+  - HLSL (`shader-language-server`): pass `--locked` to `cargo install` when building from source
+    on macOS (and in the manual-install instructions), honoring the crate's packaged `Cargo.lock`.
+    Without it, fresh dependency resolution pulled in shader-sense 1.4.0, which no longer compiles
+    against the pinned shader_language_server 1.3.1, breaking the macOS CI job.
+  - `typescript_vts`: Add `initialization_options` setting in `ls_specific_settings.typescript_vts`. 
+    Enables Yarn PnP setups with `typescript.tsdk` pointing at the Yarn-generated SDK.
+  - TypeScript/VTS: disable automatic typing acquisition during initialization (no network
+    downloads at startup) and replace the fixed 2-second cross-file reference wait with
+    event-based `$/progress` indexing tracking (configurable `indexing_timeout`, default 30s)
+  - C#: minor fixes in Omnisharp and Roslyn that prevented startup on some systems #1617
+  - `SvelteLanguageServer`: Fix diagnostics requests for TypeScript/JavaScript files incorrectly being
+    processed by the Svelte LS instead of the TypeScript LS.
+  - `SvelteLanguageServer`: Fix document-symbol requests for TypeScript/JavaScript files returning empty
+    results in svelte-only mode (`languages: [svelte]`. #1552
+  - `JuliaLanguageServer`: Fix the stdio MCP server exiting right after `initialize` ("tools fetch failed")
+    when `julia` is enabled. #1577
+  - `Java`: invalidate JDTLS workspace cache when Java import settings change #1576
+  - `Java`: use `JAVA_HOME` for Gradle import when `use_system_java_home` is enabled and `gradle_java_home`
+    is unset. #1657
+  - `Java`: stop hard-ignoring directories named `target`/`build`/`bin`/`out`/`classes`/`dist`/`lib` in
+    `EclipseJDTLS`. These are all valid Java package identifiers, so ignoring them by name hid legitimate
+    source from the symbol tools even when they were not gitignored. Removed the hardcoded override; real
+    build output is already excluded via `.gitignore`. #1645
+  - Improve quoting of arguments in shell executions
+  - Add **LaTeX** support (experimental) via [texlab](https://github.com/latex-lsp/texlab).
+  - PHP: add support for PHPantom as alternative to the already supported PHP LS #1554.
+  - Add new launch command customization options: `ls_args`, `ls_extra_args` and `ls_base_cmd`
+  - Add new configuration option `ls_workspace_folders` to allow indexed source folders to be specified
+    explicitly. In monorepos, this allows the set of indexed folders to be restricted to a subset of
+    the repository. #1627
+  - Rename configuration option `additional_workspace_folders` to `ls_additional_workspace_folders`
+    and support the option across all language servers (previously limited to TypeScript).
+
+* JetBrains:
+  - Add configuration option `jetbrains_launch_command`, allowing Serena to spawn IDE instances automatically
+    upon project activation
+  - Fix: `jet_brains_list_inspections` failed when only default parameters were used #1615 
+
+* Dashboard:
+  - Make list of trusted hosts configurable, fixing host validation introduced in v1.5.2 allowing only
+    default local hostnames, effectively preventing remote connections
+  - Decouple configuration computation from the agent's task queue by introducing events for agent config/status updates.
+    This allows the dashboard to display the configuration while the project provided at startup is still initialising. #1064
+  - Fix empty executions queue displaying "Loading..."
+  - Tray manager: Add NixOS-support for AppIndicator-based trays (e.g., most Wayland-trays) to the package in flake.nix.
+  - Fix: Wait for the subprocess that opens the browser window, preventing zombie processes #1488 
+
+* Hooks:
+  - Handle tool_input passed as string gracefully instead of failing (Copilot CLI sends strings).
+
+* Memories:
+  - Make memory iteration follow symbolic links 
+  - Fix: a memory name that was absolute (e.g. `/etc/cron.d/backdoor`) or contained empty path
+    segments could write outside the `memories` folder.
+
+* Dependencies:
+  - Add dependency `oslex`
+
 # v1.5.3 (2026-05-26)
+
+Add meta-data for the GitHub MCP registry
 
 # v1.5.2 (2026-05-26)
 
@@ -33,6 +161,9 @@ Status of the `main` branch. Changes prior to the next official version change w
   - Not existing paths return `False` on is ignored checks (instead of raising an error)
   - Add `serena-agent` CLI command so that `uvx serena-agent` can be used as entrypoint.
   - Fortls and pyright are now installed on the fly instead of being bundled in the serena-agent package.
+
+* Dashboard:
+  - Add host validation
 
 * Hooks:
   - Extend list of extensions that are considered code files (affects the reminder hook counter).

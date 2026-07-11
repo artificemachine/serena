@@ -21,12 +21,13 @@ from solidlsp.language_servers.common import (
 )
 from solidlsp.language_servers.typescript_language_server import TypeScriptLanguageServer
 from solidlsp.ls import (
+    DocumentSymbols,
     LanguageServerDependencyProvider,
     LanguageServerDependencyProviderSinglePath,
+    LSPFileBuffer,
     SolidLanguageServer,
 )
 from solidlsp.ls_config import FilenameMatcher, Language, LanguageServerConfig
-from solidlsp.lsp_protocol_handler.lsp_types import InitializeParams
 from solidlsp.settings import SolidLSPSettings
 
 log = logging.getLogger(__name__)
@@ -118,8 +119,8 @@ class SvelteTypeScriptServer(TypeScriptLanguageServer):
         return "typescript"
 
     @override
-    def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
-        params = super()._get_initialize_params(repository_absolute_path)
+    def _create_base_initialize_params(self) -> dict:
+        params = super()._create_base_initialize_params()
         params["initializationOptions"] = {
             "plugins": [
                 {
@@ -436,9 +437,9 @@ class SvelteLanguageServer(SolidLanguageServer):
                 return
             _orig_notify_send("$/onDidChangeTsOrJsFile", {"uri": uri, "changes": changes})
 
-        self.server.notify.send_notification = send_notification_wrapped  # type: ignore[method-assign]  # type: ignore[method-assign]  # type: ignore[method-assign]
+        self.server.notify.send_notification = send_notification_wrapped
 
-    def _get_initialize_params(self) -> InitializeParams:
+    def _create_base_initialize_params(self) -> dict:
         """
         Returns the initialize params for the Svelte Language Server.
 
@@ -449,8 +450,6 @@ class SvelteLanguageServer(SolidLanguageServer):
         The resulting dict is also stored as :attr:`_lsp_configuration` so
         ``workspace/configuration`` requests can be answered with real values.
         """
-        root_uri = pathlib.Path(self.repo_path).as_uri()
-
         # base configuration mirroring all plugin-sections from svelte-vscode initializationOptions
         lsp_config: dict[str, Any] = {
             "svelte": {},
@@ -512,17 +511,8 @@ class SvelteLanguageServer(SolidLanguageServer):
                 "dontFilterIncompleteCompletions": True,
                 "configuration": lsp_config,
             },
-            "processId": os.getpid(),
-            "rootPath": self.repo_path,
-            "rootUri": root_uri,
-            "workspaceFolders": [
-                {
-                    "uri": root_uri,
-                    "name": os.path.basename(self.repo_path),
-                }
-            ],
         }
-        return cast(InitializeParams, initialize_params)
+        return initialize_params
 
     def _start_server(self) -> None:
         def window_log_message(msg: dict) -> None:
@@ -560,7 +550,7 @@ class SvelteLanguageServer(SolidLanguageServer):
         self._wrap_notify_send_for_ts_js_mirror()
         self.server.start()
 
-        init_params = self._get_initialize_params()
+        init_params = self._create_initialize_params()
         init_response = self.server.send.initialize(init_params)
 
         assert "documentSymbolProvider" in init_response["capabilities"], "Svelte LSP did not advertise documentSymbolProvider"
@@ -646,6 +636,38 @@ class SvelteLanguageServer(SolidLanguageServer):
             with self._ts_server.open_file(relative_file_path):
                 return self._ts_server.request_definition(relative_file_path, line, column)
         return super().request_definition(relative_file_path, line, column)
+
+    @override
+    def request_document_symbols(self, relative_file_path: str, file_buffer: LSPFileBuffer | None = None) -> DocumentSymbols:
+        """Delegate document-symbol requests for .ts/.js files to the companion TS server.
+
+        The base svelte LS only provides ``documentSymbol`` for .svelte files and returns nothing for
+        .ts/.js files. Without this override, symbols defined in plain .ts/.js modules would be
+        undiscoverable via ``find_symbol``/``get_symbols_overview`` and ``find_referencing_symbols``
+        would fail outright, since it must first locate the target symbol via ``documentSymbol``.
+        Routing .ts/.js files to the companion (svelte-plugin-aware) typescript LS mirrors the
+        existing references/definition/rename delegations.
+
+        The companion's own ``file_buffer`` is not reused here: the provided buffer (if any) is bound
+        to this svelte LS, so the companion opens and reads the file itself.
+        Falls back to the svelte LS when the companion is unavailable or when the file is .svelte.
+        """
+        if _is_ts_file(relative_file_path) and self._ts_server is not None:
+            return self._ts_server.request_document_symbols(relative_file_path)
+        return super().request_document_symbols(relative_file_path, file_buffer)
+
+    @override
+    def request_text_document_diagnostics(
+        self,
+        relative_file_path: str,
+        start_line: int = 0,
+        end_line: int = -1,
+        min_severity: int = 4,
+    ) -> list[ls_types.Diagnostic]:
+        if _is_ts_file(relative_file_path) and self._ts_server is not None:
+            with self._ts_server.open_file(relative_file_path):
+                return self._ts_server.request_text_document_diagnostics(relative_file_path, start_line, end_line, min_severity)
+        return super().request_text_document_diagnostics(relative_file_path, start_line, end_line, min_severity)
 
     @override
     def _get_language_id_for_file(self, relative_file_path: str) -> str:
