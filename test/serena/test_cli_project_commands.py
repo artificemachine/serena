@@ -2,14 +2,17 @@
 
 import os
 import shutil
+import signal
 import tempfile
+import threading
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from click.testing import CliRunner
 
-from serena.cli import ProjectCommands, TopLevelCommands, find_project_root
+from serena.cli import ProjectCommands, TopLevelCommands, _install_shutdown_signal_handlers, find_project_root
 from serena.config.serena_config import ProjectConfig
 
 pytestmark = pytest.mark.filterwarnings("ignore::UserWarning")
@@ -354,6 +357,40 @@ class TestFindProjectRoot:
             assert os.path.samefile(result, worktree)
         finally:
             os.chdir(original_cwd)
+
+
+class TestShutdownSignalHandlers:
+    """Tests for graceful MCP server shutdown signal handling."""
+
+    def test_second_shutdown_signal_is_ignored(self, monkeypatch):
+        """A second termination signal must not interrupt cleanup."""
+        registered_handlers = {}
+        force_exit_timer = Mock()
+        timer_factory = Mock(return_value=force_exit_timer)
+
+        def register_handler(signum, handler):
+            registered_handlers[signum] = handler
+
+        monkeypatch.setattr(signal, "signal", register_handler)
+        monkeypatch.setattr(threading, "Timer", timer_factory)
+        _install_shutdown_signal_handlers()
+
+        first_signal = getattr(signal, "SIGHUP", signal.SIGTERM)
+        first_handler = registered_handlers[first_signal]
+        assert first_handler is registered_handlers[signal.SIGTERM]
+
+        with pytest.raises(SystemExit) as exc_info:
+            first_handler(first_signal, None)
+        assert exc_info.value.code == 0
+        assert registered_handlers[first_signal] is signal.SIG_IGN
+        assert registered_handlers[signal.SIGTERM] is signal.SIG_IGN
+        timer_factory.assert_called_once_with(5.0, os._exit, args=(0,))
+        assert force_exit_timer.daemon is True
+        force_exit_timer.start.assert_called_once_with()
+
+        # Simulate a queued SIGTERM invoking the original callback. It must be
+        # a no-op rather than raise a second SystemExit during cleanup.
+        first_handler(signal.SIGTERM, None)
 
 
 class TestProjectFromCwdMutualExclusivity:
