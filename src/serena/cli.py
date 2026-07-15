@@ -3,8 +3,10 @@ import glob
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from logging import Logger
@@ -49,6 +51,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _MAX_CONTENT_WIDTH = 200
+_SHUTDOWN_FORCE_EXIT_TIMEOUT_SECONDS = 5.0
 _MODES_EXPLANATION = """\b\nBuilt-in mode names or paths to custom mode YAMLs with which to 
 override the default_modes defined in the global Serena configuration or 
 the active project.
@@ -60,6 +63,39 @@ be added on top of the other modes specified by the global/project configuration
 For details on mode configuration, see 
   https://oraios.github.io/serena/02-usage/050_configuration.html#modes.
 """
+
+
+def _install_shutdown_signal_handlers() -> None:
+    """Install one-shot signal handlers that allow graceful server cleanup."""
+    handled_signals = [signal.SIGTERM]
+    if sighup := getattr(signal, "SIGHUP", None):
+        handled_signals.append(sighup)
+    shutdown_requested = False
+
+    def _handle_term(signum: int, frame: object) -> None:
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+
+        # A terminal/client teardown can deliver SIGHUP followed immediately by
+        # SIGTERM. Ignore both after the first signal so cleanup cannot be
+        # interrupted by a second SystemExit.
+        for handled_signal in handled_signals:
+            signal.signal(handled_signal, signal.SIG_IGN)
+
+        # The MCP stdio reader may remain blocked while the client waits for this
+        # process to exit. Give project/LSP cleanup time to finish, then bypass
+        # interpreter finalization so a lingering reader thread cannot abort.
+        force_exit_timer = threading.Timer(_SHUTDOWN_FORCE_EXIT_TIMEOUT_SECONDS, os._exit, args=(0,))
+        force_exit_timer.daemon = True
+        force_exit_timer.start()
+
+        log.info("Received signal %s — initiating graceful shutdown", signum)
+        raise SystemExit(0)
+
+    for handled_signal in handled_signals:
+        signal.signal(handled_signal, _handle_term)
 
 
 def find_project_root(root: str | Path | None = None) -> str | None:
@@ -392,14 +428,7 @@ class TopLevelCommands(AutoRegisteringGroup):
         # server_lifespan finally-block runs (agent.shutdown → LSP cleanup).
         # Without this, Python's default SIGTERM disposition kills the process
         # immediately and language-server children are orphaned.
-        import signal as _signal
-
-        def _handle_term(signum: int, frame: object) -> None:
-            log.info("Received signal %s — initiating graceful shutdown", signum)
-            raise SystemExit(0)
-
-        _signal.signal(_signal.SIGTERM, _handle_term)
-        _signal.signal(_signal.SIGHUP, _handle_term)
+        _install_shutdown_signal_handlers()
 
         log.info("Starting MCP server …")
         try:
