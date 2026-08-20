@@ -691,3 +691,5 @@ superseded by upstream's restructured/renumbered docs tree), and
 v1.5.3's agent API). Kept as legitimate fork-only additions with no upstream equivalent:
 `.github/workflows/junie.yml`, `.serena/memories/*.md`, `lessons_learned.md`,
 `llms-install.md`, `src/serena/resources/dashboard/news/*.html`.
+
+- **tests:** the Zig suite now skips cleanly when the toolchain is absent instead of erroring. `ZigLanguageServer._setup_runtime_dependency()` raises rather than returning a falsy value when `zig` or `zls` is missing, and the `language_server` fixture hits it during setup, so any machine without them collected 12 ERRORs. Zig was the only toolchain-gated language missing from `_determine_disabled_languages()` in `test/conftest.py` — ~12 others (nix, lean4, crystal, julia, haskell, ocaml, r, perl, …) already route through `language_tests_enabled`. Added `Language.ZIG` to that list and the matching `pytestmark` to `test_zig_basic.py`. CI is unaffected: the native-toolchain job installs zig and zls, so the tests still run there.
