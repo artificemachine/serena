@@ -448,6 +448,13 @@ def _determine_disabled_languages() -> list[Language]:
         result.append(Language.OCAML)
     if not _is_perl_language_server_available():  # perl ships with the OS; the LS module is the real signal
         result.append(Language.PERL)
+    # ZigLanguageServer._setup_runtime_dependency() hard-raises when either the
+    # zig toolchain or zls is missing, so without this the zig suite ERRORs on
+    # any machine that lacks them instead of skipping like every other
+    # toolchain-gated language above. Windows is excluded for the same reason
+    # zls.py refuses to run there (cross-file references are unreliable).
+    if _sh.which("zig") is None or _sh.which("zls") is None or is_windows:
+        result.append(Language.ZIG)
 
     # === 4. Enabled everywhere: every language NOT listed in this function (python, go, java, ...) ===
 

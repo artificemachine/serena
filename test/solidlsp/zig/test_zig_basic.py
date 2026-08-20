@@ -13,8 +13,18 @@ import pytest
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import Language
 from solidlsp.ls_types import SymbolKind
+from test.conftest import language_tests_enabled
 from test.solidlsp.conftest import format_symbol_for_assert, has_malformed_name, request_all_symbols
 from test.solidlsp.util.diagnostics import assert_file_diagnostics
+
+# Without this, a machine lacking the zig toolchain or zls gets 12 collection
+# ERRORs instead of skips: ZigLanguageServer._setup_runtime_dependency() raises
+# rather than returning a falsy value, and the fixture hits it during setup.
+# Every other toolchain-gated language (nix, lean4, crystal, julia, ...) routes
+# through language_tests_enabled the same way.
+pytestmark = pytest.mark.skipif(
+    not language_tests_enabled(Language.ZIG), reason="Zig tests are disabled (zig toolchain or zls not available)"
+)
 
 
 @pytest.mark.zig
